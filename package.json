@@ -1,0 +1,14 @@
+{
+  "name": "remorahq-terminal-bridge-plugins",
+  "version": "0.1.0",
+  "description": "RemoraHQ Terminal Bridge MeshCentral plugin",
+  "main": "remoraTerminalBridge.js",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lockbb1/RemoraHQ-Terminal-Bridge-Plugins.git"
+  },
+  "engines": {
+    "meshcentral": ">=1.1.56"
+  }
+}
