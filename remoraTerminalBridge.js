@@ -3,7 +3,7 @@
  *
  * Server-side validator + correlation issuer for RemoraHQ terminal sessions.
  * Pairs with the Terminal UI in RC-12.1+ that opens the actual meshrelay
- * WebSocket using the {sessionId, relayUrl} this plugin issues.
+ * WebSocket using the {sessionId, relayUrl, protocol} this plugin issues.
  *
  * Responsibilities:
  *   1. Validate input — shell choice against an allow-list, context value,
@@ -11,8 +11,11 @@
  *   2. For context='system' — verify the supplied TOTP token against the
  *      calling user's `otpsecret` via `otplib` (same scheme Mesh uses for
  *      login 2FA). Rejection surfaces as result:'error', error:'2fa-failed'.
- *   3. Issue a correlation `sessionId` (random) + a `relayUrl` pointing at
- *      Mesh's native `meshrelay.ashx` with the nodeid + shell parameters.
+ *   3. Map (shell, context) → Mesh native terminal protocol number
+ *      (see PROTOCOL_MAP below). Build a relayUrl pointing at Mesh's native
+ *      meshrelay.ashx using the proper `browser=1&p=<N>&nodeid&id` shape.
+ *      The browser session cookie carries `auth` — Mesh's relay handler
+ *      pairs the browser-side WS with the agent tunnel by `id`.
  *   4. Dispatch an audit event so security/compliance can trace every
  *      terminal-open.
  *
@@ -26,12 +29,18 @@
  *     totpToken?: '<6-digit-string>',
  *     tag, responseid
  *   }
- *   server → client (ok): { result:'ok', sessionId, relayUrl }
+ *   server → client (ok): { result:'ok', sessionId, relayUrl, protocol }
  *   server → client (err): { result:'error', error:'<slug>' }
  *
- * Audit events:
- *   { etype:'terminal-open', action:'plugin.terminal.open', context, shell,
- *     nodeid, actor, sessionId } via parent.parent.DispatchEvent.
+ * Changelog:
+ *   0.1.1 (2026-05-17) - real Mesh terminal protocol:
+ *     - PROTOCOL_MAP for shell+context → Mesh protocol number (1/6/8/9)
+ *     - relayUrl now uses `browser=1&p=<N>&nodeid&id` (no junk shell/context
+ *       params, no `p=2` which is desktop). Same-origin session cookie
+ *       carries auth automatically.
+ *     - response payload extended with `protocol` so the frontend can
+ *       send the matching {protocol,cols,rows,type:'options'} handshake.
+ *   0.1.0 (2026-05-16) - initial release, mock relay URL.
  */
 
 'use strict';
@@ -39,9 +48,33 @@
 var crypto = require('crypto');
 
 var PLUGIN_SHORT_NAME = 'remoraTerminalBridge';
-var PLUGIN_VERSION = '0.1.0';
+var PLUGIN_VERSION = '0.1.1';
 var ALLOWED_SHELLS = ['cmd', 'powershell', 'bash', 'zsh'];
 var ALLOWED_CONTEXTS = ['user', 'system'];
+
+// Mesh native terminal protocol numbers — see meshcore.js around lines
+// 2642 (PowerShell dispatch), 2675-2734 (cmd/sh dispatch by uid), and the
+// terminal protocol allow-list in meshrelay.js:584 (msgid 14, the "Started
+// terminal session" audit family covers [1,6,8,9]).
+//
+//   1 = admin shell        (Windows cmd as SYSTEM     | Linux sh as root)
+//   6 = admin PowerShell   (Windows PowerShell as SYSTEM — Windows only)
+//   8 = user shell         (Windows cmd as console user| Linux sh as console user via consoleUid)
+//   9 = user PowerShell    (Windows PowerShell as console user — Windows only)
+//
+// Linux note: Mesh does not differentiate bash vs zsh — it uses the user's
+// default $SHELL. We accept bash|zsh in the API for forward-compat and UX
+// parity, but they map to the same protocol numbers as a generic shell.
+var PROTOCOL_MAP = {
+    'cmd|user':         8,
+    'cmd|system':       1,
+    'powershell|user':  9,
+    'powershell|system': 6,
+    'bash|user':        8,
+    'bash|system':      1,
+    'zsh|user':         8,
+    'zsh|system':       1
+};
 
 module.exports.remoraTerminalBridge = function (parent) {
     var obj = {};
@@ -134,6 +167,11 @@ module.exports.remoraTerminalBridge = function (parent) {
             return replyError(session, command, 'invalid_context');
         }
 
+        var protocol = PROTOCOL_MAP[shell + '|' + context];
+        if (typeof protocol !== 'number') {
+            return replyError(session, command, 'unsupported_shell_context');
+        }
+
         // Resolve the calling user — meshuser session attaches it as `dbGet.user`.
         var user = dbGet && dbGet.user;
         var actor = user ? user._id : null;
@@ -147,6 +185,7 @@ module.exports.remoraTerminalBridge = function (parent) {
                     nodeid: nodeId,
                     shell: shell,
                     context: context,
+                    protocol: protocol,
                     actor: actor,
                     status: 'denied'
                 });
@@ -155,27 +194,30 @@ module.exports.remoraTerminalBridge = function (parent) {
         }
 
         var sessionId = newSessionId();
-        // Build relay URL pointing at Mesh's native meshrelay.ashx. The Terminal
-        // UI (RC-12.1) opens this URL as a binary WebSocket and proxies xterm.js
-        // I/O through it. The `auth` cookie that Mesh requires is already on the
-        // browser from the main session — same-origin lets it ride.
-        var relayUrl = '/meshrelay.ashx?id=' + sessionId
+        // Mesh-native relay URL. `browser=1` tells the relay handler this is
+        // the browser side of a tunnel pair; the server auto-spawns the agent
+        // side by sending a tunnel command with the matching `id`. The user's
+        // session cookie carries auth same-origin — no `auth=` query needed.
+        var relayUrl = '/meshrelay.ashx?browser=1&p=' + protocol
             + '&nodeid=' + encodeURIComponent(nodeId)
-            + '&p=2' // p=2 = terminal feature per Mesh convention
-            + '&shell=' + encodeURIComponent(shell)
-            + '&context=' + encodeURIComponent(context);
+            + '&id=' + sessionId;
 
         dispatchAudit(actor, {
             msg: 'Terminal session opened',
             nodeid: nodeId,
             shell: shell,
             context: context,
+            protocol: protocol,
             actor: actor,
             sessionId: sessionId,
             status: 'success'
         });
 
-        reply(session, command, { sessionId: sessionId, relayUrl: relayUrl });
+        reply(session, command, {
+            sessionId: sessionId,
+            relayUrl: relayUrl,
+            protocol: protocol
+        });
     };
 
     return obj;
