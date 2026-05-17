@@ -29,10 +29,23 @@
  *     totpToken?: '<6-digit-string>',
  *     tag, responseid
  *   }
- *   server → client (ok): { result:'ok', sessionId, relayUrl, protocol }
+ *   server → client (ok): {
+ *     result: 'ok',
+ *     sessionId, relayUrl, protocol,
+ *     agentTunnel: { nodeId, value }   // caller dispatches via control.ashx
+ *   }
  *   server → client (err): { result:'error', error:'<slug>' }
  *
  * Changelog:
+ *   0.1.2 (2026-05-17) - wake the agent via tunnel msg:
+ *     - Compute `rauth` cookie via meshServer.encodeCookie({ruserid:user._id}
+ *       , loginCookieEncryptionKey). Mesh's relay handler validates it with
+ *       decodeCookie(..., 240) (4-hour TTL).
+ *     - Return `agentTunnel` payload so the transport layer can dispatch
+ *       `{action:'msg',type:'tunnel',nodeid,value,usage:1}` via control.ashx
+ *       — without this, the agent never connects to the relay, the browser
+ *       side waits alone and Mesh drops it after ~30 s (code 1005).
+ *     - Reject unauthenticated callers (rcookie requires user._id).
  *   0.1.1 (2026-05-17) - real Mesh terminal protocol:
  *     - PROTOCOL_MAP for shell+context → Mesh protocol number (1/6/8/9)
  *     - relayUrl now uses `browser=1&p=<N>&nodeid&id` (no junk shell/context
@@ -48,7 +61,7 @@
 var crypto = require('crypto');
 
 var PLUGIN_SHORT_NAME = 'remoraTerminalBridge';
-var PLUGIN_VERSION = '0.1.1';
+var PLUGIN_VERSION = '0.1.2';
 var ALLOWED_SHELLS = ['cmd', 'powershell', 'bash', 'zsh'];
 var ALLOWED_CONTEXTS = ['user', 'system'];
 
@@ -175,6 +188,9 @@ module.exports.remoraTerminalBridge = function (parent) {
         // Resolve the calling user — meshuser session attaches it as `dbGet.user`.
         var user = dbGet && dbGet.user;
         var actor = user ? user._id : null;
+        if (!actor) {
+            return replyError(session, command, 'auth_required');
+        }
 
         // SYSTEM context requires a fresh TOTP token. User context is gated only
         // by the active Mesh session (caller already authenticated).
@@ -193,14 +209,47 @@ module.exports.remoraTerminalBridge = function (parent) {
             }
         }
 
+        // Mesh agent-side rauth cookie. Mesh's relay handler validates the
+        // browser-issued `?rauth=<cookie>` query via
+        //   meshServer.decodeCookie(rauth, loginCookieEncryptionKey, 240)
+        // and accepts the agent side if `rcookie.ruserid` is set. The 240
+        // means the cookie expires in 4 hours, same as Mesh native.
+        var rcookie = null;
+        try {
+            if (obj.meshServer
+                && typeof obj.meshServer.encodeCookie === 'function'
+                && obj.meshServer.loginCookieEncryptionKey) {
+                rcookie = obj.meshServer.encodeCookie(
+                    { ruserid: actor },
+                    obj.meshServer.loginCookieEncryptionKey
+                );
+            }
+        } catch (e) {
+            console.log('[remoraTerminalBridge] encodeCookie failed:', e.message);
+        }
+        if (!rcookie) {
+            return replyError(session, command, 'rcookie_encode_failed');
+        }
+
         var sessionId = newSessionId();
-        // Mesh-native relay URL. `browser=1` tells the relay handler this is
-        // the browser side of a tunnel pair; the server auto-spawns the agent
-        // side by sending a tunnel command with the matching `id`. The user's
-        // session cookie carries auth same-origin — no `auth=` query needed.
+        // Browser-side relay URL. `browser=1` flags this as the user end of a
+        // tunnel pair; auth comes from the same-origin session cookie. The
+        // agent end is opened only after the caller dispatches the tunnel msg
+        // built below into control.ashx.
         var relayUrl = '/meshrelay.ashx?browser=1&p=' + protocol
             + '&nodeid=' + encodeURIComponent(nodeId)
             + '&id=' + sessionId;
+
+        // Tunnel msg `value` the FRONTEND/transport must dispatch via
+        // control.ashx: `{action:'msg',type:'tunnel',nodeid,value,usage:1}`.
+        // Mesh forwards it to the agent, which then opens its meshrelay side
+        // with `rauth=<rcookie>` to authenticate. Format matches meshctrl.js
+        // :2150 and the working terminal HAR (nodeid is NOT URL-encoded in
+        // the value string — agent parses it as a literal substring).
+        var agentTunnelValue = '*/meshrelay.ashx?p=' + protocol
+            + '&nodeid=' + nodeId
+            + '&id=' + sessionId
+            + '&rauth=' + rcookie;
 
         dispatchAudit(actor, {
             msg: 'Terminal session opened',
@@ -216,7 +265,11 @@ module.exports.remoraTerminalBridge = function (parent) {
         reply(session, command, {
             sessionId: sessionId,
             relayUrl: relayUrl,
-            protocol: protocol
+            protocol: protocol,
+            agentTunnel: {
+                nodeId: nodeId,
+                value: agentTunnelValue
+            }
         });
     };
 

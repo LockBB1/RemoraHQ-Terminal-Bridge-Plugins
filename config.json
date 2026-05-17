@@ -1,7 +1,7 @@
 {
   "name": "RemoraHQ - Terminal Bridge",
   "shortName": "remoraTerminalBridge",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Server-side bridge for RemoraHQ Terminal sessions. Validates shell choice + 2FA TOTP for SYSTEM-context sessions, issues correlation sessionId + relayUrl, dispatches audit-event for every terminal open. Pairs with the RemoraHQ Terminal UI in RC-12.1.",
   "hasAdminPanel": false,
   "homepage": "https://github.com/lockbb1/RemoraHQ-Terminal-Bridge-Plugins",
