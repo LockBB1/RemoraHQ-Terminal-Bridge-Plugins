@@ -61,9 +61,40 @@
 var crypto = require('crypto');
 
 var PLUGIN_SHORT_NAME = 'remoraTerminalBridge';
-var PLUGIN_VERSION = '0.1.2';
+var PLUGIN_VERSION = '0.2.0';
 var ALLOWED_SHELLS = ['cmd', 'powershell', 'bash', 'zsh'];
 var ALLOWED_CONTEXTS = ['user', 'system'];
+
+// v0.2.0 (RC-13.19.1) — server-side TOTP grant cache.
+//
+// The frontend caches a "TOTP accepted" flag per agent for 15 min so the
+// user is not re-prompted for an authenticator code on every reconnect
+// to the same admin shell within that window. Before v0.2.0 the server
+// always required a fresh totpToken regardless, which meant every
+// post-cache reconnect failed with `2fa-failed`. We now keep a parallel
+// grant Map here so the server-side check honours the same TTL.
+//
+// Key: '<actor>|<nodeId>'  (e.g. 'user//abc|node//xyz')
+// Value: epoch-ms when TOTP was last verified for that pair.
+//
+// In-memory only — restarting Mesh clears all grants, which is the
+// safer default for a security gate.
+var totpGrantCache = Object.create(null);
+var TOTP_GRANT_TTL_MS = 15 * 60 * 1000;
+
+function totpGrantKey(actor, nodeId) { return String(actor) + '|' + String(nodeId); }
+
+function hasValidTotpGrant(actor, nodeId) {
+    var k = totpGrantKey(actor, nodeId);
+    var ts = totpGrantCache[k];
+    if (!ts) return false;
+    if (Date.now() - ts >= TOTP_GRANT_TTL_MS) { delete totpGrantCache[k]; return false; }
+    return true;
+}
+
+function markTotpGrant(actor, nodeId) {
+    totpGrantCache[totpGrantKey(actor, nodeId)] = Date.now();
+}
 
 // Mesh native terminal protocol numbers — see meshcore.js around lines
 // 2642 (PowerShell dispatch), 2675-2734 (cmd/sh dispatch by uid), and the
@@ -192,21 +223,33 @@ module.exports.remoraTerminalBridge = function (parent) {
             return replyError(session, command, 'auth_required');
         }
 
-        // SYSTEM context requires a fresh TOTP token. User context is gated only
-        // by the active Mesh session (caller already authenticated).
+        // SYSTEM context requires either a fresh TOTP token OR a still-valid
+        // grant from a prior successful TOTP for this (actor, nodeId). The
+        // grant TTL mirrors the frontend cache so the UI's "skip prompt"
+        // assumption no longer leads to a server-side rejection
+        // (RC-13.19.1 fix; before v0.2.0 every reconnect failed with
+        // 2fa-failed because the client cached the grant but the server
+        // demanded a fresh code each time).
         if (context === 'system') {
-            if (!verifyTotp(user, totpToken)) {
-                dispatchAudit(actor, {
-                    msg: 'Terminal open denied: invalid TOTP for SYSTEM context',
-                    nodeid: nodeId,
-                    shell: shell,
-                    context: context,
-                    protocol: protocol,
-                    actor: actor,
-                    status: 'denied'
-                });
-                return replyError(session, command, '2fa-failed');
+            var grantOk = hasValidTotpGrant(actor, nodeId);
+            if (!grantOk) {
+                if (!verifyTotp(user, totpToken)) {
+                    dispatchAudit(actor, {
+                        msg: 'Terminal open denied: invalid TOTP for SYSTEM context',
+                        nodeid: nodeId,
+                        shell: shell,
+                        context: context,
+                        protocol: protocol,
+                        actor: actor,
+                        status: 'denied'
+                    });
+                    return replyError(session, command, '2fa-failed');
+                }
+                markTotpGrant(actor, nodeId);
             }
+            // else: grant still valid — TOTP not requested, audit-flag below
+            // distinguishes the two paths so compliance reviews can see how
+            // each system-context open was authorised.
         }
 
         // Mesh agent-side rauth cookie. Mesh's relay handler validates the
