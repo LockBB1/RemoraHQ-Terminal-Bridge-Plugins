@@ -37,6 +37,14 @@
  *   server → client (err): { result:'error', error:'<slug>' }
  *
  * Changelog:
+ *   0.3.0 (2026-06-01) - operator terminal context (RC-14.27):
+ *     - ALLOWED_CONTEXTS gains 'operator'; PROTOCOL_MAP maps cmd|operator→1
+ *       and powershell|operator→6 (Windows admin shell, same as 'system').
+ *     - 'operator' is TOTP-gated identically to 'system'. The shell runs under
+ *       the calling operator's AD identity via S4U2Self — the agent derives the
+ *       identity from the server-trusted `httprequest.username` and only checks
+ *       the browser `xoptions.remoraOperator` flag to SELECT the mode, so the
+ *       browser cannot impersonate. See meshcore.js mod 1.1.0.
  *   0.1.2 (2026-05-17) - wake the agent via tunnel msg:
  *     - Compute `rauth` cookie via meshServer.encodeCookie({ruserid:user._id}
  *       , loginCookieEncryptionKey). Mesh's relay handler validates it with
@@ -61,9 +69,13 @@
 var crypto = require('crypto');
 
 var PLUGIN_SHORT_NAME = 'remoraTerminalBridge';
-var PLUGIN_VERSION = '0.2.0';
+var PLUGIN_VERSION = '0.3.0';
 var ALLOWED_SHELLS = ['cmd', 'powershell', 'bash', 'zsh'];
-var ALLOWED_CONTEXTS = ['user', 'system'];
+// 'operator' (RC-14.27) is a Windows admin shell (protocol 1/6) that the agent
+// re-launches under the calling operator's AD identity via S4U2Self. Server-side
+// it is gated exactly like 'system' (TOTP). The agent decides operator-vs-SYSTEM
+// from the browser `xoptions.remoraOperator` flag + the server-trusted username.
+var ALLOWED_CONTEXTS = ['user', 'system', 'operator'];
 
 // v0.2.0 (RC-13.19.1) — server-side TOTP grant cache.
 //
@@ -112,8 +124,10 @@ function markTotpGrant(actor, nodeId) {
 var PROTOCOL_MAP = {
     'cmd|user':         8,
     'cmd|system':       1,
+    'cmd|operator':     1,
     'powershell|user':  9,
     'powershell|system': 6,
+    'powershell|operator': 6,
     'bash|user':        8,
     'bash|system':      1,
     'zsh|user':         8,
@@ -230,7 +244,7 @@ module.exports.remoraTerminalBridge = function (parent) {
         // (RC-13.19.1 fix; before v0.2.0 every reconnect failed with
         // 2fa-failed because the client cached the grant but the server
         // demanded a fresh code each time).
-        if (context === 'system') {
+        if (context === 'system' || context === 'operator') {
             var grantOk = hasValidTotpGrant(actor, nodeId);
             if (!grantOk) {
                 if (!verifyTotp(user, totpToken)) {
