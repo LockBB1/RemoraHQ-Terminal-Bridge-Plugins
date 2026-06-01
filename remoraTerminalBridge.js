@@ -37,6 +37,10 @@
  *   server → client (err): { result:'error', error:'<slug>' }
  *
  * Changelog:
+ *   0.3.2 (2026-06-01) - signed operator UPN grant:
+ *     - Includes the server-resolved operator UPN inside the signed grant so
+ *       meshuser.js can inject it even when its live session user object is
+ *       sparse. The browser still cannot choose or alter the UPN.
  *   0.3.1 (2026-06-01) - operator identity source hardening:
  *     - Adds `agentTunnel.remoraOperator` + signed `remoraOperatorGrant` so
  *       meshuser.js can inject `remoraOperatorUpn` from the authenticated
@@ -76,7 +80,7 @@
 var crypto = require('crypto');
 
 var PLUGIN_SHORT_NAME = 'remoraTerminalBridge';
-var PLUGIN_VERSION = '0.3.1';
+var PLUGIN_VERSION = '0.3.2';
 var ALLOWED_SHELLS = ['cmd', 'powershell', 'bash', 'zsh'];
 // 'operator' (RC-14.27) is a Windows admin shell (protocol 1/6) that the agent
 // re-launches under the calling operator's AD identity via S4U2Self. Server-side
@@ -196,6 +200,17 @@ module.exports.remoraTerminalBridge = function (parent) {
         }
     }
 
+    function resolveOperatorUpn(user) {
+        if (!user) return null;
+        var candidates = [user.upn, user.email, user.name];
+        for (var i = 0; i < candidates.length; i++) {
+            if (typeof candidates[i] !== 'string') continue;
+            var value = candidates[i].trim();
+            if (/^[^\\\/@\s]+@[^\\\/@\s]+\.[^\\\/@\s]+$/.test(value)) return value;
+        }
+        return null;
+    }
+
     function dispatchAudit(actor, payload) {
         try {
             if (!obj.meshServer || typeof obj.meshServer.DispatchEvent !== 'function') return;
@@ -298,13 +313,19 @@ module.exports.remoraTerminalBridge = function (parent) {
         var sessionId = newSessionId();
         var remoraOperatorGrant = null;
         if (context === 'operator') {
+            var operatorUpn = resolveOperatorUpn(user);
+            if (!operatorUpn) {
+                console.log('[remoraTerminalBridge] operator UPN unavailable for user:', actor);
+                return replyError(session, command, 'operator_upn_unavailable');
+            }
             try {
                 remoraOperatorGrant = obj.meshServer.encodeCookie(
                     {
                         remoraOperator: 1,
                         ruserid: actor,
                         nodeid: nodeId,
-                        sessionId: sessionId
+                        sessionId: sessionId,
+                        operatorUpn: operatorUpn
                     },
                     obj.meshServer.loginCookieEncryptionKey
                 );
