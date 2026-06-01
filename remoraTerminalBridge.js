@@ -32,20 +32,26 @@
  *   server → client (ok): {
  *     result: 'ok',
  *     sessionId, relayUrl, protocol,
- *     agentTunnel: { nodeId, value, remoraOperator?, remoraOperatorGrant? }
+ *     agentTunnel: { nodeId, value, remoraOperator? }
  *   }
  *   server → client (err): { result:'error', error:'<slug>' }
  *
  * Changelog:
- *   0.3.2 (2026-06-01) - signed operator UPN grant:
- *     - Includes the server-resolved operator UPN inside the signed grant so
- *       meshuser.js can inject it even when its live session user object is
- *       sparse. The browser still cannot choose or alter the UPN.
- *   0.3.1 (2026-06-01) - operator identity source hardening:
- *     - Adds `agentTunnel.remoraOperator` + signed `remoraOperatorGrant` so
- *       meshuser.js can inject `remoraOperatorUpn` from the authenticated
- *       server-side user object only after validating the plugin-issued grant.
- *       The browser cannot choose the identity or mint operator-mode grants.
+ *   0.3.3 (2026-06-01) - drop signed operator grant + meshuser.js patch:
+ *     - The operator UPN is no longer resolved or carried by the plugin. The
+ *       agent derives the identity from the server-authenticated tunnel
+ *       `username` (Mesh sets command.username = user.name natively in
+ *       meshrelay.js; the browser cannot forge it) as `<sam>@<USERDNSDOMAIN>`,
+ *       relying on the LDAP `ldapUserName` = sAMAccountName mapping. The plugin
+ *       now only flags `agentTunnel.remoraOperator` and keeps the TOTP gate.
+ *       Removes resolveOperatorUpn + the signed `remoraOperatorGrant` cookie and
+ *       the companion meshuser.js patch. See meshcore.js mod 1.1.5.
+ *   0.3.2 (2026-06-01) - signed operator UPN grant (SUPERSEDED by 0.3.3):
+ *     - Included the server-resolved operator UPN inside a signed grant for a
+ *       meshuser.js injector. Abandoned — the native tunnel username is enough.
+ *   0.3.1 (2026-06-01) - operator identity source hardening (SUPERSEDED):
+ *     - Added `agentTunnel.remoraOperator` + a signed grant for a meshuser.js
+ *       injector. Abandoned in 0.3.3 (patch was fragile and crashed meshuser.js).
  *   0.3.0 (2026-06-01) - operator terminal context (RC-14.27):
  *     - ALLOWED_CONTEXTS gains 'operator'; PROTOCOL_MAP maps cmd|operator→1
  *       and powershell|operator→6 (Windows admin shell, same as 'system').
@@ -80,7 +86,7 @@
 var crypto = require('crypto');
 
 var PLUGIN_SHORT_NAME = 'remoraTerminalBridge';
-var PLUGIN_VERSION = '0.3.2';
+var PLUGIN_VERSION = '0.3.3';
 var ALLOWED_SHELLS = ['cmd', 'powershell', 'bash', 'zsh'];
 // 'operator' (RC-14.27) is a Windows admin shell (protocol 1/6) that the agent
 // re-launches under the calling operator's AD identity via S4U2Self. Server-side
@@ -200,17 +206,6 @@ module.exports.remoraTerminalBridge = function (parent) {
         }
     }
 
-    function resolveOperatorUpn(user) {
-        if (!user) return null;
-        var candidates = [user.upn, user.email, user.name];
-        for (var i = 0; i < candidates.length; i++) {
-            if (typeof candidates[i] !== 'string') continue;
-            var value = candidates[i].trim();
-            if (/^[^\\\/@\s]+@[^\\\/@\s]+\.[^\\\/@\s]+$/.test(value)) return value;
-        }
-        return null;
-    }
-
     function dispatchAudit(actor, payload) {
         try {
             if (!obj.meshServer || typeof obj.meshServer.DispatchEvent !== 'function') return;
@@ -311,31 +306,10 @@ module.exports.remoraTerminalBridge = function (parent) {
         }
 
         var sessionId = newSessionId();
-        var remoraOperatorGrant = null;
-        if (context === 'operator') {
-            var operatorUpn = resolveOperatorUpn(user);
-            if (!operatorUpn) {
-                console.log('[remoraTerminalBridge] operator UPN unavailable for user:', actor);
-                return replyError(session, command, 'operator_upn_unavailable');
-            }
-            try {
-                remoraOperatorGrant = obj.meshServer.encodeCookie(
-                    {
-                        remoraOperator: 1,
-                        ruserid: actor,
-                        nodeid: nodeId,
-                        sessionId: sessionId,
-                        operatorUpn: operatorUpn
-                    },
-                    obj.meshServer.loginCookieEncryptionKey
-                );
-            } catch (e) {
-                console.log('[remoraTerminalBridge] operator grant encode failed:', e.message);
-            }
-            if (!remoraOperatorGrant) {
-                return replyError(session, command, 'operator_grant_encode_failed');
-            }
-        }
+        // RC-14.27 (v0.3.3): the operator identity is NOT carried by the plugin.
+        // The agent derives it from the server-authenticated `httprequest.username`
+        // (Mesh sets command.username = user.name natively in meshrelay.js). The
+        // plugin only flags operator mode below; it cannot and must not choose WHO.
         // Browser-side relay URL. `browser=1` flags this as the user end of a
         // tunnel pair; auth comes from the same-origin session cookie. The
         // agent end is opened only after the caller dispatches the tunnel msg
@@ -373,8 +347,7 @@ module.exports.remoraTerminalBridge = function (parent) {
             agentTunnel: {
                 nodeId: nodeId,
                 value: agentTunnelValue,
-                remoraOperator: context === 'operator',
-                remoraOperatorGrant: remoraOperatorGrant
+                remoraOperator: context === 'operator'
             }
         });
     };
