@@ -32,19 +32,25 @@
  *   server → client (ok): {
  *     result: 'ok',
  *     sessionId, relayUrl, protocol,
- *     agentTunnel: { nodeId, value }   // caller dispatches via control.ashx
+ *     agentTunnel: { nodeId, value, remoraOperator? } // caller dispatches via control.ashx
  *   }
  *   server → client (err): { result:'error', error:'<slug>' }
  *
  * Changelog:
+ *   0.3.1 (2026-06-01) - operator identity source hardening:
+ *     - Adds `agentTunnel.remoraOperator` so meshuser.js can inject
+ *       `remoraOperatorUpn` from the authenticated server-side user object.
+ *       The browser still cannot choose the identity.
  *   0.3.0 (2026-06-01) - operator terminal context (RC-14.27):
  *     - ALLOWED_CONTEXTS gains 'operator'; PROTOCOL_MAP maps cmd|operator→1
  *       and powershell|operator→6 (Windows admin shell, same as 'system').
  *     - 'operator' is TOTP-gated identically to 'system'. The shell runs under
  *       the calling operator's AD identity via S4U2Self — the agent derives the
- *       identity from the server-trusted `httprequest.username` and only checks
- *       the browser `xoptions.remoraOperator` flag to SELECT the mode, so the
- *       browser cannot impersonate. See meshcore.js mod 1.1.0.
+ *       identity from the server-injected `remoraOperatorUpn` field (added by
+ *       meshuser.js from the authenticated user object after rights checks) and
+ *       only checks the browser `xoptions.remoraOperator` flag to SELECT the
+ *       mode, so the browser cannot choose the identity. See meshcore.js mod
+ *       1.1.4.
  *   0.1.2 (2026-05-17) - wake the agent via tunnel msg:
  *     - Compute `rauth` cookie via meshServer.encodeCookie({ruserid:user._id}
  *       , loginCookieEncryptionKey). Mesh's relay handler validates it with
@@ -69,7 +75,7 @@
 var crypto = require('crypto');
 
 var PLUGIN_SHORT_NAME = 'remoraTerminalBridge';
-var PLUGIN_VERSION = '0.3.0';
+var PLUGIN_VERSION = '0.3.1';
 var ALLOWED_SHELLS = ['cmd', 'powershell', 'bash', 'zsh'];
 // 'operator' (RC-14.27) is a Windows admin shell (protocol 1/6) that the agent
 // re-launches under the calling operator's AD identity via S4U2Self. Server-side
@@ -325,7 +331,8 @@ module.exports.remoraTerminalBridge = function (parent) {
             protocol: protocol,
             agentTunnel: {
                 nodeId: nodeId,
-                value: agentTunnelValue
+                value: agentTunnelValue,
+                remoraOperator: context === 'operator'
             }
         });
     };
