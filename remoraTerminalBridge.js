@@ -32,15 +32,16 @@
  *   server → client (ok): {
  *     result: 'ok',
  *     sessionId, relayUrl, protocol,
- *     agentTunnel: { nodeId, value, remoraOperator? } // caller dispatches via control.ashx
+ *     agentTunnel: { nodeId, value, remoraOperator?, remoraOperatorGrant? }
  *   }
  *   server → client (err): { result:'error', error:'<slug>' }
  *
  * Changelog:
  *   0.3.1 (2026-06-01) - operator identity source hardening:
- *     - Adds `agentTunnel.remoraOperator` so meshuser.js can inject
- *       `remoraOperatorUpn` from the authenticated server-side user object.
- *       The browser still cannot choose the identity.
+ *     - Adds `agentTunnel.remoraOperator` + signed `remoraOperatorGrant` so
+ *       meshuser.js can inject `remoraOperatorUpn` from the authenticated
+ *       server-side user object only after validating the plugin-issued grant.
+ *       The browser cannot choose the identity or mint operator-mode grants.
  *   0.3.0 (2026-06-01) - operator terminal context (RC-14.27):
  *     - ALLOWED_CONTEXTS gains 'operator'; PROTOCOL_MAP maps cmd|operator→1
  *       and powershell|operator→6 (Windows admin shell, same as 'system').
@@ -295,6 +296,25 @@ module.exports.remoraTerminalBridge = function (parent) {
         }
 
         var sessionId = newSessionId();
+        var remoraOperatorGrant = null;
+        if (context === 'operator') {
+            try {
+                remoraOperatorGrant = obj.meshServer.encodeCookie(
+                    {
+                        remoraOperator: 1,
+                        ruserid: actor,
+                        nodeid: nodeId,
+                        sessionId: sessionId
+                    },
+                    obj.meshServer.loginCookieEncryptionKey
+                );
+            } catch (e) {
+                console.log('[remoraTerminalBridge] operator grant encode failed:', e.message);
+            }
+            if (!remoraOperatorGrant) {
+                return replyError(session, command, 'operator_grant_encode_failed');
+            }
+        }
         // Browser-side relay URL. `browser=1` flags this as the user end of a
         // tunnel pair; auth comes from the same-origin session cookie. The
         // agent end is opened only after the caller dispatches the tunnel msg
@@ -332,7 +352,8 @@ module.exports.remoraTerminalBridge = function (parent) {
             agentTunnel: {
                 nodeId: nodeId,
                 value: agentTunnelValue,
-                remoraOperator: context === 'operator'
+                remoraOperator: context === 'operator',
+                remoraOperatorGrant: remoraOperatorGrant
             }
         });
     };
