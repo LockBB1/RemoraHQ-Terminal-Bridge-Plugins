@@ -37,6 +37,15 @@
  *   server → client (err): { result:'error', error:'<slug>' }
  *
  * Changelog:
+ *   0.4.0 (2026-06-02) - server-side RBAC enforcement of SYSTEM terminal (RC-15.A.1):
+ *     - context='system' now verifies `canUseSystemTerminal` from the
+ *       `remoraPermissions` site-doc (super-admins implicit) BEFORE issuing the
+ *       rauth cookie. Until now this was UI-only (TerminalToolbar hid the menu);
+ *       a raw `context=system` command sent past the UI still got a cookie. The
+ *       open flow moved into a hoisted proceedOpen() so the async grant lookup
+ *       gates it. Denied opens dispatch an audit event (status:'denied',
+ *       error:'permission_denied'). Fail-closed on missing DB access.
+ *       user/operator contexts unchanged.
  *   0.3.3 (2026-06-01) - drop signed operator grant + meshuser.js patch:
  *     - The operator UPN is no longer resolved or carried by the plugin. The
  *       agent derives the identity from the server-authenticated tunnel
@@ -86,13 +95,24 @@
 var crypto = require('crypto');
 
 var PLUGIN_SHORT_NAME = 'remoraTerminalBridge';
-var PLUGIN_VERSION = '0.3.3';
+var PLUGIN_VERSION = '0.4.0';
 var ALLOWED_SHELLS = ['cmd', 'powershell', 'bash', 'zsh'];
 // 'operator' (RC-14.27) is a Windows admin shell (protocol 1/6) that the agent
 // re-launches under the calling operator's AD identity via S4U2Self. Server-side
 // it is gated exactly like 'system' (TOTP). The agent decides operator-vs-SYSTEM
 // from the browser `xoptions.remoraOperator` flag + the server-trusted username.
 var ALLOWED_CONTEXTS = ['user', 'system', 'operator'];
+
+// RC-15.A.1 — server-side RBAC enforcement of the SYSTEM terminal.
+// The `remoraPermissions` site-wide doc (owned by remoraCore) stores grants as
+// `{ <userid>: { canUseSystemTerminal: true } }`. Super-admins implicitly hold
+// every flag and are never stored. Until now `canUseSystemTerminal` was a UI-only
+// gate (TerminalToolbar hid the option) — a raw `context=system` command sent past
+// the UI still reached here and was issued an rauth cookie. We now verify the flag
+// server-side BEFORE issuing the cookie, so the UI is no longer the authority.
+var REMORA_PERMISSIONS_DOC_ID = 'remoraPermissions';
+var PERMISSION_SYSTEM_TERMINAL = 'canUseSystemTerminal';
+function isSuperAdmin(user) { return !!user && user.siteadmin === 0xFFFFFFFF; }
 
 // v0.2.0 (RC-13.19.1) — server-side TOTP grant cache.
 //
@@ -206,6 +226,20 @@ module.exports.remoraTerminalBridge = function (parent) {
         }
     }
 
+    // RC-15.A.1 — async check of the SYSTEM-terminal grant. Super-admins pass
+    // implicitly. Fail-closed: any missing DB access or absent grant denies.
+    function hasSystemTerminalPermission(user, cb) {
+        if (isSuperAdmin(user)) return cb(true);
+        if (!obj.meshServer || !obj.meshServer.db || typeof obj.meshServer.db.Get !== 'function') {
+            return cb(false);
+        }
+        obj.meshServer.db.Get(REMORA_PERMISSIONS_DOC_ID, function (err, docs) {
+            var grants = (!err && docs && docs.length > 0 && docs[0].grants && typeof docs[0].grants === 'object') ? docs[0].grants : {};
+            var mine = grants[user._id] || {};
+            cb(mine[PERMISSION_SYSTEM_TERMINAL] === true);
+        });
+    }
+
     function dispatchAudit(actor, payload) {
         try {
             if (!obj.meshServer || typeof obj.meshServer.DispatchEvent !== 'function') return;
@@ -254,6 +288,34 @@ module.exports.remoraTerminalBridge = function (parent) {
             return replyError(session, command, 'auth_required');
         }
 
+        // RC-15.A.1 — server-enforce the SYSTEM terminal BEFORE issuing the
+        // rauth cookie. context='system' requires canUseSystemTerminal (or
+        // super-admin); without it a raw command past the UI is denied here.
+        // user/operator are unaffected (operator keeps its own TOTP tier).
+        // The rest of the open flow runs in proceedOpen() so it can wait on the
+        // async grant lookup; the function is hoisted so it's callable above.
+        if (context === 'system') {
+            hasSystemTerminalPermission(user, function (allowed) {
+                if (!allowed) {
+                    dispatchAudit(actor, {
+                        msg: 'Terminal open denied: missing canUseSystemTerminal',
+                        nodeid: nodeId,
+                        shell: shell,
+                        context: context,
+                        protocol: protocol,
+                        actor: actor,
+                        status: 'denied'
+                    });
+                    return replyError(session, command, 'permission_denied');
+                }
+                proceedOpen();
+            });
+        } else {
+            proceedOpen();
+        }
+        return;
+
+        function proceedOpen() {
         // SYSTEM context requires either a fresh TOTP token OR a still-valid
         // grant from a prior successful TOTP for this (actor, nodeId). The
         // grant TTL mirrors the frontend cache so the UI's "skip prompt"
@@ -350,6 +412,7 @@ module.exports.remoraTerminalBridge = function (parent) {
                 remoraOperator: context === 'operator'
             }
         });
+        } // proceedOpen
     };
 
     return obj;
