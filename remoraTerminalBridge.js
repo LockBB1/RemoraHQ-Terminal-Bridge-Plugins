@@ -37,6 +37,22 @@
  *   server → client (err): { result:'error', error:'<slug>' }
  *
  * Changelog:
+ *   0.6.0 (2026-06-03) - Remote Install reachability + push (RC-15.14):
+ *     - New pluginactions remoteInstall.reachability (ICMP Test-Connection +
+ *       WinRM Negotiate bind with the stored push cred) and remoteInstall.run
+ *       (the actual WAC-style push). Both gated by canRemoteInstall
+ *       (hasRemoteInstallPermission, super-admin implicit, fail-closed); run
+ *       additionally requires a TOTP step-up (fresh token or a valid grant for
+ *       actor+host, 15-min TTL) and is per-actor rate-limited (20/min).
+ *     - run generates the per-group MeshAgent installer SERVER-SIDE via
+ *       meshServer.exeHandler.streamExeWithMeshPolicy into a temp file under
+ *       datapath (no HTTP, so nginx/TLSOffload is irrelevant), then over ONE
+ *       WinRM PSSession copies it to the target (Copy-Item -ToSession) and runs
+ *       `<agent>.exe -fullinstall`, cleaning up both ends. The .msh policy
+ *       mirrors the native /meshagents path for the connectivity-critical
+ *       fields (MeshName/Type/ID, ServerID, MeshServer wss URL, InstallFlags);
+ *       optional domain agentcustomization branding is not replicated yet.
+ *     - All push events audited (etype 'remote-install') with host/group/exit.
  *   0.5.1 (2026-06-03) - fix: testAccount reply field collision (RC-15.13):
  *     - handleRiTestAccount returned the test outcome under `result`, which
  *       collided with the protocol envelope `result:'ok'` set by reply() —
@@ -119,7 +135,7 @@ var fs = require('fs');
 var path = require('path');
 
 var PLUGIN_SHORT_NAME = 'remoraTerminalBridge';
-var PLUGIN_VERSION = '0.5.1';
+var PLUGIN_VERSION = '0.6.0';
 var ALLOWED_SHELLS = ['cmd', 'powershell', 'bash', 'zsh'];
 // 'operator' (RC-14.27) is a Windows admin shell (protocol 1/6) that the agent
 // re-launches under the calling operator's AD identity via S4U2Self. Server-side
@@ -154,6 +170,15 @@ var REMORA_RI_ENTROPY = 'RemoraHQ.RemoteInstall.v1.dpapi.entropy';
 var RI_USERNAME_RE = /^[A-Za-z0-9._\-\\@]{1,256}$/;
 var RI_HOST_RE = /^[A-Za-z0-9.\-]{1,255}$/;
 var RI_BLOB_RE = /^[A-Za-z0-9+/=]{1,8192}$/;
+// RC-15.14 — push execution. Machine Group id form `mesh/<domain>/<seg>`
+// (default domain → `mesh//<seg>`); seg is url-safe base64 (+/ as @ $).
+var RI_GROUP_RE = /^mesh\/[A-Za-z0-9.\-]*\/[A-Za-z0-9@$_\-]{1,128}$/;
+var RI_INSTALL_AGENTID = 4; // MeshService64.exe — signed Windows x86-64 service.
+var PERMISSION_REMOTE_INSTALL = 'canRemoteInstall';
+// Per-actor rate limit on the privileged push (sliding window).
+var RI_RUN_MAX = 20;
+var RI_RUN_WINDOW_MS = 60 * 1000;
+var riRunTimes = Object.create(null);
 
 // v0.2.0 (RC-13.19.1) — server-side TOTP grant cache.
 //
@@ -295,8 +320,8 @@ module.exports.remoraTerminalBridge = function (parent) {
         }
     }
 
-    // RC-15.13 — audit for Remote Install credential management. Distinct action
-    // so compliance can filter cred changes separately from terminal opens.
+    // RC-15.13/.14 — audit for Remote Install (cred management + push). Distinct
+    // action so compliance can filter these separately from terminal opens.
     function dispatchRiAudit(actor, payload) {
         try {
             if (!obj.meshServer || typeof obj.meshServer.DispatchEvent !== 'function') return;
@@ -304,7 +329,7 @@ module.exports.remoraTerminalBridge = function (parent) {
             if (actor) targets.push(actor);
             obj.meshServer.DispatchEvent(targets, obj, Object.assign({
                 etype: 'remote-install',
-                action: 'plugin.remoteinstall.cred'
+                action: 'plugin.remoteinstall'
             }, payload));
         } catch (e) {
             console.log('[remoraTerminalBridge] RI audit dispatch failed:', e.message);
@@ -340,7 +365,7 @@ module.exports.remoraTerminalBridge = function (parent) {
     // Spawn Windows PowerShell (5.1, always present on the Windows Mesh host and
     // the only runtime guaranteed to ship the DPAPI ProtectedData API). The
     // script is passed via -EncodedCommand so stdin stays free for the secret.
-    function runPowerShell(script, stdinText, cb) {
+    function runPowerShell(script, stdinText, cb, timeoutMs) {
         var cp = require('child_process');
         var done = false, out = '', err = '', timer = null, ps;
         function finish(e, res) {
@@ -354,7 +379,7 @@ module.exports.remoraTerminalBridge = function (parent) {
                 '-EncodedCommand', psEncode(script)
             ], { windowsHide: true });
         } catch (e) { return finish(e); }
-        timer = setTimeout(function () { try { ps.kill(); } catch (x) { /* ignore */ } finish(new Error('powershell_timeout')); }, 30000);
+        timer = setTimeout(function () { try { ps.kill(); } catch (x) { /* ignore */ } finish(new Error('powershell_timeout')); }, timeoutMs || 30000);
         ps.stdout.on('data', function (d) { out += d.toString('utf8'); });
         ps.stderr.on('data', function (d) { err += d.toString('utf8'); });
         ps.on('error', function (e) { finish(e); });
@@ -477,6 +502,203 @@ module.exports.remoraTerminalBridge = function (parent) {
         });
     }
 
+    // ---- RC-15.14: Remote Install reachability + push --------------------------
+
+    // Async check of canRemoteInstall (clone of hasSystemTerminalPermission).
+    // Super-admin implicit, fail-closed.
+    function hasRemoteInstallPermission(user, cb) {
+        if (isSuperAdmin(user)) return cb(true);
+        if (!obj.meshServer || !obj.meshServer.db || typeof obj.meshServer.db.Get !== 'function') return cb(false);
+        obj.meshServer.db.Get(REMORA_PERMISSIONS_DOC_ID, function (err, docs) {
+            var grants = (!err && docs && docs.length > 0 && docs[0].grants && typeof docs[0].grants === 'object') ? docs[0].grants : {};
+            var mine = grants[user._id] || {};
+            cb(mine[PERMISSION_REMOTE_INSTALL] === true);
+        });
+    }
+
+    function riRateLimitOk(actor) {
+        var now = Date.now();
+        var arr = (riRunTimes[actor] || []).filter(function (t) { return now - t < RI_RUN_WINDOW_MS; });
+        if (arr.length >= RI_RUN_MAX) { riRunTimes[actor] = arr; return false; }
+        arr.push(now); riRunTimes[actor] = arr; return true;
+    }
+
+    // Build the .msh policy + stream the per-group agent into a temp file.
+    // Mirrors webserver.js handleAgentRequest (the native /meshagents path) for
+    // the connectivity-critical fields. Optional domain agentcustomization
+    // (displayName/serviceName/etc.) is NOT replicated — the agent still connects;
+    // branding parity can be added later if needed. cb(err, localExePath).
+    function riGenerateInstaller(groupId, installFlags, cb) {
+        try {
+            var ws = obj.meshServer.webserver;
+            if (!ws || !ws.meshes || !obj.meshServer.exeHandler || !obj.meshServer.meshAgentBinaries) return cb(new Error('server_api_unavailable'));
+            var mesh = ws.meshes[groupId];
+            if (!mesh) return cb(new Error('invalid_group'));
+
+            var parts = groupId.split('/');           // ['mesh', '<domain>', '<seg>']
+            var domainId = parts[1] || '';
+            var seg = parts[2] || '';
+            var domain = (obj.meshServer.config && obj.meshServer.config.domains && obj.meshServer.config.domains[domainId]) || { id: domainId, dns: null };
+
+            var meshidhex = Buffer.from(seg.replace(/@/g, '+').replace(/\$/g, '/'), 'base64').toString('hex').toUpperCase();
+            var serveridhex = String(ws.agentCertificateHashHex || '').toUpperCase();
+            if (!meshidhex || !serveridhex) return cb(new Error('id_resolve_failed'));
+
+            var args = obj.meshServer.args || {};
+            var httpsPort = (args.aliasport == null) ? args.port : args.aliasport;
+            if (args.agentport != null) httpsPort = args.agentport;
+            if (args.agentaliasport != null) httpsPort = args.agentaliasport;
+
+            var serverName = (typeof ws.getWebServerName === 'function') ? ws.getWebServerName(domain, null) : (obj.meshServer.certificates && obj.meshServer.certificates.CommonName);
+            if (!serverName || serverName === 'un-configured') return cb(new Error('servername_unresolved'));
+            var xdomain = (domainId === '') ? '' : (domainId + '/');
+
+            var msh = '\r\nMeshName=' + mesh.name + '\r\nMeshType=' + mesh.mtype + '\r\nMeshID=0x' + meshidhex + '\r\nServerID=' + serveridhex + '\r\n';
+            if (args.lanonly === true) { msh += 'MeshServer=local\r\n'; }
+            else { msh += 'MeshServer=wss://' + serverName + ':' + httpsPort + '/' + xdomain + 'agent.ashx\r\n'; }
+            if (installFlags && parseInt(installFlags, 10) === installFlags) { msh += 'InstallFlags=' + parseInt(installFlags, 10) + '\r\n'; }
+
+            var binId = RI_INSTALL_AGENTID;
+            var bin = (domain.meshAgentBinaries && domain.meshAgentBinaries[binId]) || obj.meshServer.meshAgentBinaries[binId];
+            if (!bin || !bin.path) return cb(new Error('agent_binary_missing'));
+
+            var tmpDir = path.join(obj.meshServer.datapath, 'remora-ri-tmp');
+            try { fs.mkdirSync(tmpDir, { recursive: true }); } catch (e) { /* exists */ }
+            var localExe = path.join(tmpDir, 'ra-' + crypto.randomBytes(8).toString('hex') + '.exe');
+
+            var outStream = fs.createWriteStream(localExe);
+            var settled = false;
+            function done(err) { if (settled) return; settled = true; cb(err, err ? null : localExe); }
+            outStream.on('error', function (e) { done(e); });
+            outStream.on('close', function () { done(null); });
+            try {
+                obj.meshServer.exeHandler.streamExeWithMeshPolicy({
+                    platform: 'win32', sourceFileName: bin.path, destinationStream: outStream, msh: msh, peinfo: bin.pe
+                });
+            } catch (e) { done(e); }
+        } catch (e) { cb(e); }
+    }
+
+    function riCleanup(localExe) { if (localExe) { try { fs.unlinkSync(localExe); } catch (e) { /* ignore */ } } }
+
+    // Reachability precheck: ICMP + WinRM bind with the stored push cred.
+    function riReachabilityScript(blob, username, host) {
+        return [
+            "$ErrorActionPreference='Stop'",
+            "$ping=$false; $winrm=$false",
+            "try { $ping = Test-Connection -ComputerName '" + host + "' -Count 1 -Quiet } catch {}",
+            "try {",
+            "  Add-Type -AssemblyName System.Security",
+            "  $enc=[Convert]::FromBase64String('" + blob + "')",
+            "  $e=[Text.Encoding]::UTF8.GetBytes('" + REMORA_RI_ENTROPY + "')",
+            "  $dec=[Security.Cryptography.ProtectedData]::Unprotect($enc,$e,[Security.Cryptography.DataProtectionScope]::LocalMachine)",
+            "  $pw=[Text.Encoding]::UTF8.GetString($dec); $sec=ConvertTo-SecureString $pw -AsPlainText -Force; $pw=$null",
+            "  $cred=New-Object System.Management.Automation.PSCredential('" + username + "',$sec)",
+            "  $r=Invoke-Command -ComputerName '" + host + "' -Authentication Negotiate -Credential $cred -ScriptBlock { 'ok' } -ErrorAction Stop",
+            "  if ($r -eq 'ok') { $winrm=$true }",
+            "} catch {}",
+            "Write-Output ('ping=' + $ping + ';winrm=' + $winrm)"
+        ].join("\n");
+    }
+
+    // Push: open one PSSession, copy the generated agent, run -fullinstall, clean up.
+    function riRunScript(blob, username, host, localExe) {
+        return [
+            "$ErrorActionPreference='Stop'",
+            "try {",
+            "  Add-Type -AssemblyName System.Security",
+            "  $enc=[Convert]::FromBase64String('" + blob + "')",
+            "  $e=[Text.Encoding]::UTF8.GetBytes('" + REMORA_RI_ENTROPY + "')",
+            "  $dec=[Security.Cryptography.ProtectedData]::Unprotect($enc,$e,[Security.Cryptography.DataProtectionScope]::LocalMachine)",
+            "  $pw=[Text.Encoding]::UTF8.GetString($dec); $sec=ConvertTo-SecureString $pw -AsPlainText -Force; $pw=$null",
+            "  $cred=New-Object System.Management.Automation.PSCredential('" + username + "',$sec)",
+            "  $s=New-PSSession -ComputerName '" + host + "' -Authentication Negotiate -Credential $cred -ErrorAction Stop",
+            "  try {",
+            "    $rt = Invoke-Command -Session $s -ScriptBlock { Join-Path $env:TEMP ('ra-' + [guid]::NewGuid().ToString('N') + '.exe') }",
+            "    Copy-Item -ToSession $s -Path '" + localExe.replace(/'/g, "''") + "' -Destination $rt -Force",
+            "    $code = Invoke-Command -Session $s -ScriptBlock { param($p) & $p -fullinstall | Out-Null; $c=$LASTEXITCODE; Start-Sleep -Seconds 1; Remove-Item $p -Force -ErrorAction SilentlyContinue; $c } -ArgumentList $rt",
+            "    Write-Output ('install-exit:' + $code)",
+            "  } finally { Remove-PSSession $s }",
+            "} catch { Write-Error $_.Exception.Message; exit 1 }"
+        ].join("\n");
+    }
+
+    function handleRiReachability(command, dbGet, session) {
+        var user = dbGet && dbGet.user;
+        hasRemoteInstallPermission(user, function (allowed) {
+            if (!allowed) {
+                dispatchRiAudit(user && user._id, { msg: 'Remote Install reachability denied', actor: user && user._id, status: 'denied' });
+                return replyError(session, command, 'permission_denied');
+            }
+            var host = String(command.host || '');
+            if (!RI_HOST_RE.test(host)) return replyError(session, command, 'invalid_host');
+            var meta = riReadCredMeta();
+            if (!meta || !meta.blob || !RI_BLOB_RE.test(meta.blob) || !RI_USERNAME_RE.test(meta.username || '')) {
+                return replyError(session, command, 'not_configured');
+            }
+            runPowerShell(riReachabilityScript(meta.blob, meta.username, host), null, function (err, res) {
+                if (err || !res) return replyError(session, command, 'reachability_failed');
+                var out = res.stdout || '';
+                var ping = /ping=True/i.test(out);
+                var winrm = /winrm=True/i.test(out);
+                reply(session, command, { reachable: ping, winrm: winrm });
+            });
+        });
+    }
+
+    function handleRiRun(command, dbGet, session) {
+        var user = dbGet && dbGet.user;
+        hasRemoteInstallPermission(user, function (allowed) {
+            var actor = user && user._id;
+            if (!allowed) {
+                dispatchRiAudit(actor, { msg: 'Remote Install push denied (missing canRemoteInstall)', actor: actor, status: 'denied' });
+                return replyError(session, command, 'permission_denied');
+            }
+            var host = String(command.host || '');
+            var groupId = String(command.groupId || '');
+            var installFlags = (typeof command.installFlags === 'number') ? command.installFlags : 0;
+            var totpToken = command.totpToken;
+            if (!RI_HOST_RE.test(host)) return replyError(session, command, 'invalid_host');
+            if (!RI_GROUP_RE.test(groupId)) return replyError(session, command, 'invalid_group');
+
+            // TOTP step-up (fresh token or a still-valid grant for this actor+host).
+            if (!hasValidTotpGrant(actor, host)) {
+                if (!verifyTotp(user, totpToken)) {
+                    dispatchRiAudit(actor, { msg: 'Remote Install push denied (TOTP)', actor: actor, host: host, group: groupId, status: 'denied' });
+                    return replyError(session, command, '2fa-failed');
+                }
+                markTotpGrant(actor, host);
+            }
+            if (!riRateLimitOk(actor)) {
+                dispatchRiAudit(actor, { msg: 'Remote Install push rate-limited', actor: actor, host: host, status: 'denied' });
+                return replyError(session, command, 'rate_limited');
+            }
+            var meta = riReadCredMeta();
+            if (!meta || !meta.blob || !RI_BLOB_RE.test(meta.blob) || !RI_USERNAME_RE.test(meta.username || '')) {
+                return replyError(session, command, 'not_configured');
+            }
+
+            riGenerateInstaller(groupId, installFlags, function (genErr, localExe) {
+                if (genErr || !localExe) {
+                    dispatchRiAudit(actor, { msg: 'Remote Install installer-gen failed', actor: actor, host: host, group: groupId, status: 'error', detail: genErr && genErr.message });
+                    return replyError(session, command, 'installer_gen_failed');
+                }
+                runPowerShell(riRunScript(meta.blob, meta.username, host, localExe), null, function (err, res) {
+                    riCleanup(localExe);
+                    var m = res && /install-exit:(-?\d+)/.exec(res.stdout || '');
+                    var exitCode = m ? parseInt(m[1], 10) : null;
+                    var ok = !err && res && res.code === 0 && exitCode === 0;
+                    dispatchRiAudit(actor, {
+                        msg: ok ? 'Remote Install push succeeded' : 'Remote Install push failed',
+                        actor: actor, host: host, group: groupId, exitCode: exitCode, status: ok ? 'success' : 'error'
+                    });
+                    if (ok) return reply(session, command, { ok: true, host: host, group: groupId });
+                    return replyError(session, command, 'install_failed');
+                }, 180000); // push can take a while: download already local, copy + -fullinstall
+            });
+        });
+    }
+
     obj.serveraction = function (command, dbGet, ws) {
         var session = dbGet || ws;
         if (!session || typeof session.send !== 'function') return;
@@ -488,6 +710,8 @@ module.exports.remoraTerminalBridge = function (parent) {
         if (action === 'remoteInstall.accountStatus') return handleRiAccountStatus(command, dbGet, session);
         if (action === 'remoteInstall.setAccount') return handleRiSetAccount(command, dbGet, session);
         if (action === 'remoteInstall.testAccount') return handleRiTestAccount(command, dbGet, session);
+        if (action === 'remoteInstall.reachability') return handleRiReachability(command, dbGet, session);
+        if (action === 'remoteInstall.run') return handleRiRun(command, dbGet, session);
         if (action !== 'open') return replyError(session, command, 'unknown_pluginaction');
 
         var nodeId = (command.nodeId != null) ? String(command.nodeId) : '';
