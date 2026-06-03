@@ -37,6 +37,12 @@
  *   server → client (err): { result:'error', error:'<slug>' }
  *
  * Changelog:
+ *   0.5.1 (2026-06-03) - fix: testAccount reply field collision (RC-15.13):
+ *     - handleRiTestAccount returned the test outcome under `result`, which
+ *       collided with the protocol envelope `result:'ok'` set by reply() —
+ *       Object.assign let the payload clobber the 'ok' marker, so a client
+ *       checking `data.result === 'ok'` saw 'winrm-ok'/'decrypt-ok' instead and
+ *       treated success as failure. Renamed the payload field to `testResult`.
  *   0.5.0 (2026-06-03) - Remote Install cred vault (RC-15.13):
  *     - New super-admin-only pluginactions remoteInstall.setAccount /
  *       .accountStatus / .testAccount manage the per-server push service
@@ -113,7 +119,7 @@ var fs = require('fs');
 var path = require('path');
 
 var PLUGIN_SHORT_NAME = 'remoraTerminalBridge';
-var PLUGIN_VERSION = '0.5.0';
+var PLUGIN_VERSION = '0.5.1';
 var ALLOWED_SHELLS = ['cmd', 'powershell', 'bash', 'zsh'];
 // 'operator' (RC-14.27) is a Windows admin shell (protocol 1/6) that the agent
 // re-launches under the calling operator's AD identity via S4U2Self. Server-side
@@ -463,7 +469,10 @@ module.exports.remoraTerminalBridge = function (parent) {
                 riWriteCredMeta(meta);
             } catch (e) { /* non-fatal */ }
             dispatchRiAudit(actor, { msg: 'Remote Install account test', actor: actor, username: meta.username, host: host || null, status: ok ? 'success' : 'denied' });
-            if (ok) return reply(session, command, { ok: true, result: result });
+            // NOTE: use `testResult`, NOT `result` — `result` is the protocol
+            // envelope field ('ok'|'error') set by reply(); a `result` key in the
+            // payload would clobber the 'ok' marker the client checks.
+            if (ok) return reply(session, command, { ok: true, testResult: result });
             return replyError(session, command, host ? 'winrm_failed' : 'decrypt_failed');
         });
     }
