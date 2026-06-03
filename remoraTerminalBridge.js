@@ -37,6 +37,17 @@
  *   server → client (err): { result:'error', error:'<slug>' }
  *
  * Changelog:
+ *   0.6.1 (2026-06-04) - Remote Install authz hardening (RC-15.N SECURITY):
+ *     - Per-mesh authz on the target Machine Group. remoteInstall.run and
+ *       remoteInstall.reachability now require MESHRIGHT_EDITMESH (bit 1) on
+ *       the groupId via webserver.GetMeshRights — the same right the native
+ *       /meshagents installer download enforces. Super-admin implicit,
+ *       fail-closed. Closes a cross-mesh privilege-escalation: previously any
+ *       holder of canRemoteInstall could push an agent into ANY group (the
+ *       "only visible groups" rule was client-side only).
+ *     - remoteInstall.reachability now also requires groupId and is rate-limited
+ *       (separate per-actor bucket) — closes the free-form WinRM-Negotiate
+ *       credential-relay sink that ran with no authz / no throttle.
  *   0.6.0 (2026-06-03) - Remote Install reachability + push (RC-15.14):
  *     - New pluginactions remoteInstall.reachability (ICMP Test-Connection +
  *       WinRM Negotiate bind with the stored push cred) and remoteInstall.run
@@ -135,7 +146,7 @@ var fs = require('fs');
 var path = require('path');
 
 var PLUGIN_SHORT_NAME = 'remoraTerminalBridge';
-var PLUGIN_VERSION = '0.6.0';
+var PLUGIN_VERSION = '0.6.1';
 var ALLOWED_SHELLS = ['cmd', 'powershell', 'bash', 'zsh'];
 // 'operator' (RC-14.27) is a Windows admin shell (protocol 1/6) that the agent
 // re-launches under the calling operator's AD identity via S4U2Self. Server-side
@@ -175,10 +186,19 @@ var RI_BLOB_RE = /^[A-Za-z0-9+/=]{1,8192}$/;
 var RI_GROUP_RE = /^mesh\/[A-Za-z0-9.\-]*\/[A-Za-z0-9@$_\-]{1,128}$/;
 var RI_INSTALL_AGENTID = 4; // MeshService64.exe — signed Windows x86-64 service.
 var PERMISSION_REMOTE_INSTALL = 'canRemoteInstall';
+// Native /meshagents installer download requires this right on the target
+// device group (webserver.js handleMeshAgentRequest: GetMeshRights & 1).
+// Remote Install mirrors it so canRemoteInstall cannot cross into groups the
+// operator has no install rights on (RC-15.N).
+var MESHRIGHT_EDITMESH = 0x00000001;
 // Per-actor rate limit on the privileged push (sliding window).
 var RI_RUN_MAX = 20;
 var RI_RUN_WINDOW_MS = 60 * 1000;
 var riRunTimes = Object.create(null);
+// Reachability is lighter and UI-driven (ping refresh) — separate bucket so
+// it cannot starve the real push budget, but still throttled (RC-15.N).
+var RI_REACH_MAX = 30;
+var riReachTimes = Object.create(null);
 
 // v0.2.0 (RC-13.19.1) — server-side TOTP grant cache.
 //
@@ -516,11 +536,23 @@ module.exports.remoraTerminalBridge = function (parent) {
         });
     }
 
-    function riRateLimitOk(actor) {
+    function riRateLimitOk(actor, bucket, max) {
+        bucket = bucket || riRunTimes;
+        max = max || RI_RUN_MAX;
         var now = Date.now();
-        var arr = (riRunTimes[actor] || []).filter(function (t) { return now - t < RI_RUN_WINDOW_MS; });
-        if (arr.length >= RI_RUN_MAX) { riRunTimes[actor] = arr; return false; }
-        arr.push(now); riRunTimes[actor] = arr; return true;
+        var arr = (bucket[actor] || []).filter(function (t) { return now - t < RI_RUN_WINDOW_MS; });
+        if (arr.length >= max) { bucket[actor] = arr; return false; }
+        arr.push(now); bucket[actor] = arr; return true;
+    }
+
+    // Per-mesh authz for Remote Install: the caller must hold MESHRIGHT_EDITMESH
+    // on the target group (super-admin implicit). Mirrors the native installer
+    // download check; fail-closed on any missing server API.
+    function hasGroupInstallRight(user, groupId) {
+        if (isSuperAdmin(user)) return true;
+        var ws = obj.meshServer && obj.meshServer.webserver;
+        if (!ws || typeof ws.GetMeshRights !== 'function' || !ws.meshes || !ws.meshes[groupId]) return false;
+        return (ws.GetMeshRights(user, groupId) & MESHRIGHT_EDITMESH) !== 0;
     }
 
     // Build the .msh policy + stream the per-group agent into a temp file.
@@ -631,7 +663,17 @@ module.exports.remoraTerminalBridge = function (parent) {
                 return replyError(session, command, 'permission_denied');
             }
             var host = String(command.host || '');
+            var groupId = String(command.groupId || '');
             if (!RI_HOST_RE.test(host)) return replyError(session, command, 'invalid_host');
+            if (!RI_GROUP_RE.test(groupId)) return replyError(session, command, 'invalid_group');
+            if (!hasGroupInstallRight(user, groupId)) {
+                dispatchRiAudit(user && user._id, { msg: 'Remote Install reachability denied (no rights on group)', actor: user && user._id, host: host, group: groupId, status: 'denied' });
+                return replyError(session, command, 'permission_denied');
+            }
+            if (!riRateLimitOk(user && user._id, riReachTimes, RI_REACH_MAX)) {
+                dispatchRiAudit(user && user._id, { msg: 'Remote Install reachability rate-limited', actor: user && user._id, host: host, status: 'denied' });
+                return replyError(session, command, 'rate_limited');
+            }
             var meta = riReadCredMeta();
             if (!meta || !meta.blob || !RI_BLOB_RE.test(meta.blob) || !RI_USERNAME_RE.test(meta.username || '')) {
                 return replyError(session, command, 'not_configured');
@@ -660,6 +702,14 @@ module.exports.remoraTerminalBridge = function (parent) {
             var totpToken = command.totpToken;
             if (!RI_HOST_RE.test(host)) return replyError(session, command, 'invalid_host');
             if (!RI_GROUP_RE.test(groupId)) return replyError(session, command, 'invalid_group');
+
+            // Per-mesh authz: caller must hold install rights on the target group
+            // (cross-mesh priv-esc guard — the "visible groups only" rule was
+            // client-side only before RC-15.N).
+            if (!hasGroupInstallRight(user, groupId)) {
+                dispatchRiAudit(actor, { msg: 'Remote Install push denied (no rights on group)', actor: actor, host: host, group: groupId, status: 'denied' });
+                return replyError(session, command, 'permission_denied');
+            }
 
             // TOTP step-up (fresh token or a still-valid grant for this actor+host).
             if (!hasValidTotpGrant(actor, host)) {
