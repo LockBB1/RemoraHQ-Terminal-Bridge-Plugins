@@ -37,6 +37,22 @@
  *   server → client (err): { result:'error', error:'<slug>' }
  *
  * Changelog:
+ *   0.5.0 (2026-06-03) - Remote Install cred vault (RC-15.13):
+ *     - New super-admin-only pluginactions remoteInstall.setAccount /
+ *       .accountStatus / .testAccount manage the per-server push service
+ *       account used by the upcoming Remote Install (WAC-style WinRM push,
+ *       RC-15.14). The password is encrypted with Windows DPAPI
+ *       (DataProtectionScope.LocalMachine) via a spawned powershell.exe and
+ *       stored as a base64 blob in a LOCAL file under meshServer.datapath
+ *       (remora-remoteinstall.json) — never in the (Mongo-replicated) DB, so a
+ *       blob cannot leak to a peer region server (DPAPI is machine-bound
+ *       anyway). Plaintext never touches disk, logs, or the wire: set reads it
+ *       from powershell stdin; test decrypts + builds the PSCredential inside
+ *       the same powershell process. testAccount optionally runs a Negotiate
+ *       Invoke-Command against a host to validate the credential end-to-end.
+ *       Gated by isSuperAdmin (fail-closed). The canRemoteInstall flag that
+ *       gates operator USE of the push lives in remoraCore REMORA_PERMISSION_FLAGS
+ *       (v0.12.6) and is enforced in RC-15.14.
  *   0.4.0 (2026-06-02) - server-side RBAC enforcement of SYSTEM terminal (RC-15.A.1):
  *     - context='system' now verifies `canUseSystemTerminal` from the
  *       `remoraPermissions` site-doc (super-admins implicit) BEFORE issuing the
@@ -93,9 +109,11 @@
 'use strict';
 
 var crypto = require('crypto');
+var fs = require('fs');
+var path = require('path');
 
 var PLUGIN_SHORT_NAME = 'remoraTerminalBridge';
-var PLUGIN_VERSION = '0.4.0';
+var PLUGIN_VERSION = '0.5.0';
 var ALLOWED_SHELLS = ['cmd', 'powershell', 'bash', 'zsh'];
 // 'operator' (RC-14.27) is a Windows admin shell (protocol 1/6) that the agent
 // re-launches under the calling operator's AD identity via S4U2Self. Server-side
@@ -113,6 +131,23 @@ var ALLOWED_CONTEXTS = ['user', 'system', 'operator'];
 var REMORA_PERMISSIONS_DOC_ID = 'remoraPermissions';
 var PERMISSION_SYSTEM_TERMINAL = 'canUseSystemTerminal';
 function isSuperAdmin(user) { return !!user && user.siteadmin === 0xFFFFFFFF; }
+
+// RC-15.13 — Remote Install push-account vault.
+// The push service account password is encrypted with Windows DPAPI
+// (LocalMachine scope) and kept in a LOCAL file under meshServer.datapath, NOT
+// in the Mongo-replicated DB — so on a multi-server (rs0) deployment a region
+// server's blob never reaches a peer and, being machine-bound, could not be
+// decrypted there anyway. The entropy below is a static application constant
+// (a second DPAPI layer, not a secret); the real protection is the machine
+// binding. Cred management is super-admin-only (RC-15.13); the canRemoteInstall
+// flag that gates operator USE of the push is enforced in RC-15.14.
+var REMORA_RI_CRED_FILE = 'remora-remoteinstall.json';
+var REMORA_RI_ENTROPY = 'RemoraHQ.RemoteInstall.v1.dpapi.entropy';
+// Conservative input charsets — these values are interpolated into a PowerShell
+// script, so anything outside the set is rejected before the spawn.
+var RI_USERNAME_RE = /^[A-Za-z0-9._\-\\@]{1,256}$/;
+var RI_HOST_RE = /^[A-Za-z0-9.\-]{1,255}$/;
+var RI_BLOB_RE = /^[A-Za-z0-9+/=]{1,8192}$/;
 
 // v0.2.0 (RC-13.19.1) — server-side TOTP grant cache.
 //
@@ -254,11 +289,196 @@ module.exports.remoraTerminalBridge = function (parent) {
         }
     }
 
+    // RC-15.13 — audit for Remote Install credential management. Distinct action
+    // so compliance can filter cred changes separately from terminal opens.
+    function dispatchRiAudit(actor, payload) {
+        try {
+            if (!obj.meshServer || typeof obj.meshServer.DispatchEvent !== 'function') return;
+            var targets = ['*', 'server-users'];
+            if (actor) targets.push(actor);
+            obj.meshServer.DispatchEvent(targets, obj, Object.assign({
+                etype: 'remote-install',
+                action: 'plugin.remoteinstall.cred'
+            }, payload));
+        } catch (e) {
+            console.log('[remoraTerminalBridge] RI audit dispatch failed:', e.message);
+        }
+    }
+
+    // ---- RC-15.13: Remote Install push-account vault --------------------------
+
+    function riCredFilePath() {
+        var dp = obj.meshServer && obj.meshServer.datapath;
+        if (!dp || typeof dp !== 'string') return null;
+        return path.join(dp, REMORA_RI_CRED_FILE);
+    }
+
+    function riReadCredMeta() {
+        try {
+            var p = riCredFilePath();
+            if (!p) return null;
+            var j = JSON.parse(fs.readFileSync(p, 'utf8'));
+            return (j && typeof j === 'object') ? j : null;
+        } catch (e) { return null; }
+    }
+
+    function riWriteCredMeta(meta) {
+        var p = riCredFilePath();
+        if (!p) throw new Error('no_datapath');
+        fs.writeFileSync(p, JSON.stringify(meta, null, 2), { encoding: 'utf8', mode: 0o600 });
+    }
+
+    // PowerShell -EncodedCommand wants base64 of UTF-16LE.
+    function psEncode(script) { return Buffer.from(script, 'utf16le').toString('base64'); }
+
+    // Spawn Windows PowerShell (5.1, always present on the Windows Mesh host and
+    // the only runtime guaranteed to ship the DPAPI ProtectedData API). The
+    // script is passed via -EncodedCommand so stdin stays free for the secret.
+    function runPowerShell(script, stdinText, cb) {
+        var cp = require('child_process');
+        var done = false, out = '', err = '', timer = null, ps;
+        function finish(e, res) {
+            if (done) return; done = true;
+            if (timer) clearTimeout(timer);
+            cb(e, res);
+        }
+        try {
+            ps = cp.spawn('powershell.exe', [
+                '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+                '-EncodedCommand', psEncode(script)
+            ], { windowsHide: true });
+        } catch (e) { return finish(e); }
+        timer = setTimeout(function () { try { ps.kill(); } catch (x) { /* ignore */ } finish(new Error('powershell_timeout')); }, 30000);
+        ps.stdout.on('data', function (d) { out += d.toString('utf8'); });
+        ps.stderr.on('data', function (d) { err += d.toString('utf8'); });
+        ps.on('error', function (e) { finish(e); });
+        ps.on('close', function (code) { finish(null, { code: code, stdout: out.trim(), stderr: err.trim() }); });
+        try { if (stdinText != null) ps.stdin.write(String(stdinText) + '\n'); ps.stdin.end(); } catch (e) { /* ignore */ }
+    }
+
+    // Encrypt: password arrives on stdin, never on the command line.
+    function riProtectScript() {
+        return [
+            "$ErrorActionPreference='Stop'",
+            "try {",
+            "  Add-Type -AssemblyName System.Security",
+            "  $pw = [Console]::In.ReadLine()",
+            "  $b = [Text.Encoding]::UTF8.GetBytes($pw)",
+            "  $e = [Text.Encoding]::UTF8.GetBytes('" + REMORA_RI_ENTROPY + "')",
+            "  $p = [Security.Cryptography.ProtectedData]::Protect($b, $e, [Security.Cryptography.DataProtectionScope]::LocalMachine)",
+            "  Write-Output ([Convert]::ToBase64String($p))",
+            "} catch { Write-Error $_.Exception.Message; exit 1 }"
+        ].join("\n");
+    }
+
+    // Decrypt + (optionally) validate against a host. blob/user/host are
+    // pre-validated against RI_*_RE before interpolation. Plaintext lives only
+    // inside this PowerShell process.
+    function riTestScript(blob, username, host) {
+        var lines = [
+            "$ErrorActionPreference='Stop'",
+            "try {",
+            "  Add-Type -AssemblyName System.Security",
+            "  $enc = [Convert]::FromBase64String('" + blob + "')",
+            "  $e = [Text.Encoding]::UTF8.GetBytes('" + REMORA_RI_ENTROPY + "')",
+            "  $dec = [Security.Cryptography.ProtectedData]::Unprotect($enc, $e, [Security.Cryptography.DataProtectionScope]::LocalMachine)",
+            "  $pw = [Text.Encoding]::UTF8.GetString($dec)",
+            "  $sec = ConvertTo-SecureString $pw -AsPlainText -Force",
+            "  $pw = $null",
+            "  $cred = New-Object System.Management.Automation.PSCredential('" + username + "', $sec)"
+        ];
+        if (host) {
+            lines.push("  $r = Invoke-Command -ComputerName '" + host + "' -Authentication Negotiate -Credential $cred -ScriptBlock { 'ok' } -ErrorAction Stop");
+            lines.push("  if ($r -eq 'ok') { Write-Output 'winrm-ok' } else { Write-Output 'winrm-unexpected' }");
+        } else {
+            lines.push("  if ($cred) { Write-Output 'decrypt-ok' }");
+        }
+        lines.push("} catch { Write-Error $_.Exception.Message; exit 1 }");
+        return lines.join("\n");
+    }
+
+    function handleRiAccountStatus(command, dbGet, session) {
+        var user = dbGet && dbGet.user;
+        if (!isSuperAdmin(user)) return replyError(session, command, 'forbidden');
+        var meta = riReadCredMeta();
+        reply(session, command, {
+            configured: !!(meta && meta.blob),
+            username: (meta && meta.username) || null,
+            createdBy: (meta && meta.createdBy) || null,
+            createdAt: (meta && meta.createdAt) || null,
+            lastTestAt: (meta && meta.lastTestAt) || null,
+            lastTestResult: (meta && meta.lastTestResult) || null
+        });
+    }
+
+    function handleRiSetAccount(command, dbGet, session) {
+        var user = dbGet && dbGet.user;
+        if (!isSuperAdmin(user)) return replyError(session, command, 'forbidden');
+        var actor = user._id;
+        var username = String(command.username || '');
+        var password = String(command.password || '');
+        if (!RI_USERNAME_RE.test(username) || password.length === 0 || password.length > 1024) {
+            return replyError(session, command, 'invalid_input');
+        }
+        if (!riCredFilePath()) return replyError(session, command, 'no_datapath');
+        runPowerShell(riProtectScript(), password, function (err, res) {
+            if (err || !res || res.code !== 0 || !RI_BLOB_RE.test(res.stdout || '')) {
+                dispatchRiAudit(actor, { msg: 'Remote Install account set failed', actor: actor, username: username, status: 'error' });
+                return replyError(session, command, 'protect_failed');
+            }
+            try {
+                riWriteCredMeta({
+                    username: username,
+                    blob: res.stdout,
+                    createdBy: actor,
+                    createdAt: new Date().toISOString(),
+                    lastTestAt: null,
+                    lastTestResult: null
+                });
+            } catch (e) {
+                return replyError(session, command, 'write_failed');
+            }
+            dispatchRiAudit(actor, { msg: 'Remote Install push account configured', actor: actor, username: username, status: 'success' });
+            reply(session, command, { configured: true, username: username });
+        });
+    }
+
+    function handleRiTestAccount(command, dbGet, session) {
+        var user = dbGet && dbGet.user;
+        if (!isSuperAdmin(user)) return replyError(session, command, 'forbidden');
+        var actor = user._id;
+        var meta = riReadCredMeta();
+        if (!meta || !meta.blob) return replyError(session, command, 'not_configured');
+        if (!RI_BLOB_RE.test(meta.blob) || !RI_USERNAME_RE.test(meta.username || '')) {
+            return replyError(session, command, 'corrupt_cred');
+        }
+        var host = (command.testHost != null) ? String(command.testHost) : '';
+        if (host && !RI_HOST_RE.test(host)) return replyError(session, command, 'invalid_host');
+        runPowerShell(riTestScript(meta.blob, meta.username, host || null), null, function (err, res) {
+            var ok = !err && res && res.code === 0 && /^(winrm-ok|decrypt-ok)$/.test(res.stdout || '');
+            var result = ok ? (host ? 'winrm-ok' : 'decrypt-ok') : 'failed';
+            try {
+                meta.lastTestAt = new Date().toISOString();
+                meta.lastTestResult = result;
+                riWriteCredMeta(meta);
+            } catch (e) { /* non-fatal */ }
+            dispatchRiAudit(actor, { msg: 'Remote Install account test', actor: actor, username: meta.username, host: host || null, status: ok ? 'success' : 'denied' });
+            if (ok) return reply(session, command, { ok: true, result: result });
+            return replyError(session, command, host ? 'winrm_failed' : 'decrypt_failed');
+        });
+    }
+
     obj.serveraction = function (command, dbGet, ws) {
         var session = dbGet || ws;
         if (!session || typeof session.send !== 'function') return;
 
         var action = String(command.pluginaction || '');
+        // RC-15.13 — Remote Install cred-vault actions (super-admin-only, gated
+        // inside each handler). Kept ahead of the terminal 'open' path so the
+        // existing flow below is untouched.
+        if (action === 'remoteInstall.accountStatus') return handleRiAccountStatus(command, dbGet, session);
+        if (action === 'remoteInstall.setAccount') return handleRiSetAccount(command, dbGet, session);
+        if (action === 'remoteInstall.testAccount') return handleRiTestAccount(command, dbGet, session);
         if (action !== 'open') return replyError(session, command, 'unknown_pluginaction');
 
         var nodeId = (command.nodeId != null) ? String(command.nodeId) : '';
