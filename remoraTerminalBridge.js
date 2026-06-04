@@ -37,6 +37,20 @@
  *   server → client (err): { result:'error', error:'<slug>' }
  *
  * Changelog:
+ *   0.7.0 (2026-06-04) - Role-default + per-user override enforce (RC-15.M.2):
+ *     - hasSystemTerminalPermission / hasRemoteInstallPermission now resolve the
+ *       effective flag as override (grants[user][flag], tri-state) ?? roleDefault
+ *       [role][flag] ?? false, instead of reading grants[user._id] only. Mirrors
+ *       remoraCore 0.13.0 (M.1) which stores the roleDefaults map.
+ *     - Server-side RemoraHQ role derivation (deriveRemoraRole): siteadmin bits
+ *       + marker-usergroup membership (RemoraHQ Operators/Viewers, resolved by
+ *       NAME via webserver.userGroups). Mirrors siteadminToRole in
+ *       src/lib/contracts|utils/role.ts. auditor is treated as viewer here (it
+ *       never carries these flags by default; an explicit per-user override
+ *       always wins regardless). Super-admin implicit-all, fail-closed.
+ *     - No behavioural change until a super-admin sets a role default (no setter
+ *       UI before slot M.5): with empty roleDefaults, effective == override ==
+ *       prior behaviour.
  *   0.6.1 (2026-06-04) - Remote Install authz hardening (RC-15.N SECURITY):
  *     - Per-mesh authz on the target Machine Group. remoteInstall.run and
  *       remoteInstall.reachability now require MESHRIGHT_EDITMESH (bit 1) on
@@ -146,7 +160,7 @@ var fs = require('fs');
 var path = require('path');
 
 var PLUGIN_SHORT_NAME = 'remoraTerminalBridge';
-var PLUGIN_VERSION = '0.6.1';
+var PLUGIN_VERSION = '0.7.0';
 var ALLOWED_SHELLS = ['cmd', 'powershell', 'bash', 'zsh'];
 // 'operator' (RC-14.27) is a Windows admin shell (protocol 1/6) that the agent
 // re-launches under the calling operator's AD identity via S4U2Self. Server-side
@@ -164,6 +178,16 @@ var ALLOWED_CONTEXTS = ['user', 'system', 'operator'];
 var REMORA_PERMISSIONS_DOC_ID = 'remoraPermissions';
 var PERMISSION_SYSTEM_TERMINAL = 'canUseSystemTerminal';
 function isSuperAdmin(user) { return !!user && user.siteadmin === 0xFFFFFFFF; }
+
+// RC-15.M.2 — server-side RemoraHQ role derivation for role-default flag
+// resolution. Marker usergroup NAMES must match src/lib/utils/role.ts
+// REMORA_MARKER_UGRP_NAMES (Mesh assigns random ugrp ids, so we resolve by name
+// against webserver.userGroups). Siteadmin-bit subset mirrors role.ts.
+var REMORA_MARKER_OPERATOR = 'RemoraHQ Operators';
+var REMORA_MARKER_VIEWER = 'RemoraHQ Viewers';
+var SITERIGHT_LOCKED = 32;
+var SITERIGHT_MANAGEUSERS = 2;
+var SITERIGHT_USERGROUPS = 256;
 
 // RC-15.13 — Remote Install push-account vault.
 // The push service account password is encrypted with Windows DPAPI
@@ -312,18 +336,56 @@ module.exports.remoraTerminalBridge = function (parent) {
         }
     }
 
-    // RC-15.A.1 — async check of the SYSTEM-terminal grant. Super-admins pass
-    // implicitly. Fail-closed: any missing DB access or absent grant denies.
-    function hasSystemTerminalPermission(user, cb) {
+    // RC-15.M.2 — derive a user's RemoraHQ role server-side (super_admin handled
+    // by callers). Mirrors siteadminToRole() in src/lib/utils/role.ts. auditor is
+    // collapsed to viewer (never carries these flags by default; a per-user
+    // override wins anyway). Fail-safe default = viewer (least privilege).
+    function deriveRemoraRole(user) {
+        if (isSuperAdmin(user)) return 'super_admin';
+        var sa = (typeof user.siteadmin === 'number') ? user.siteadmin : 0;
+        if (sa !== 0) {
+            var cleared = (sa & ~SITERIGHT_LOCKED) >>> 0;
+            if ((cleared & (SITERIGHT_MANAGEUSERS | SITERIGHT_USERGROUPS)) !== 0) return 'administrator';
+        }
+        var ws = obj.meshServer && obj.meshServer.webserver;
+        var ugs = ws && ws.userGroups;
+        if (ugs && user.links) {
+            // operator takes priority over viewer when both markers present.
+            var isViewer = false;
+            for (var lk in user.links) {
+                if (lk.indexOf('ugrp/') !== 0) continue;
+                var g = ugs[lk];
+                if (!g) continue;
+                if (g.name === REMORA_MARKER_OPERATOR) return 'operator';
+                if (g.name === REMORA_MARKER_VIEWER) isViewer = true;
+            }
+            if (isViewer) return 'viewer';
+        }
+        return 'viewer';
+    }
+
+    // RC-15.M.2 — resolve the effective value of a RemoraHQ flag:
+    //   override (grants[user][flag], tri-state) ?? roleDefault[role][flag] ?? false
+    // Super-admins pass implicitly. Fail-closed: any missing DB access denies.
+    function resolveRemoraFlag(user, flag, cb) {
         if (isSuperAdmin(user)) return cb(true);
         if (!obj.meshServer || !obj.meshServer.db || typeof obj.meshServer.db.Get !== 'function') {
             return cb(false);
         }
         obj.meshServer.db.Get(REMORA_PERMISSIONS_DOC_ID, function (err, docs) {
-            var grants = (!err && docs && docs.length > 0 && docs[0].grants && typeof docs[0].grants === 'object') ? docs[0].grants : {};
+            var doc0 = (!err && docs && docs.length > 0) ? docs[0] : null;
+            var grants = (doc0 && doc0.grants && typeof doc0.grants === 'object') ? doc0.grants : {};
             var mine = grants[user._id] || {};
-            cb(mine[PERMISSION_SYSTEM_TERMINAL] === true);
+            if (typeof mine[flag] === 'boolean') return cb(mine[flag]); // explicit override wins
+            var roleDefaults = (doc0 && doc0.roleDefaults && typeof doc0.roleDefaults === 'object') ? doc0.roleDefaults : {};
+            var rd = roleDefaults[deriveRemoraRole(user)] || {};
+            return cb(rd[flag] === true);
         });
+    }
+
+    // RC-15.A.1 — SYSTEM-terminal gate; now resolves role-default + override (M.2).
+    function hasSystemTerminalPermission(user, cb) {
+        resolveRemoraFlag(user, PERMISSION_SYSTEM_TERMINAL, cb);
     }
 
     function dispatchAudit(actor, payload) {
@@ -524,16 +586,9 @@ module.exports.remoraTerminalBridge = function (parent) {
 
     // ---- RC-15.14: Remote Install reachability + push --------------------------
 
-    // Async check of canRemoteInstall (clone of hasSystemTerminalPermission).
-    // Super-admin implicit, fail-closed.
+    // canRemoteInstall gate; resolves role-default + override (M.2).
     function hasRemoteInstallPermission(user, cb) {
-        if (isSuperAdmin(user)) return cb(true);
-        if (!obj.meshServer || !obj.meshServer.db || typeof obj.meshServer.db.Get !== 'function') return cb(false);
-        obj.meshServer.db.Get(REMORA_PERMISSIONS_DOC_ID, function (err, docs) {
-            var grants = (!err && docs && docs.length > 0 && docs[0].grants && typeof docs[0].grants === 'object') ? docs[0].grants : {};
-            var mine = grants[user._id] || {};
-            cb(mine[PERMISSION_REMOTE_INSTALL] === true);
-        });
+        resolveRemoraFlag(user, PERMISSION_REMOTE_INSTALL, cb);
     }
 
     function riRateLimitOk(actor, bucket, max) {
