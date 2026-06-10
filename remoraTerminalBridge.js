@@ -37,6 +37,19 @@
  *   server → client (err): { result:'error', error:'<slug>' }
  *
  * Changelog:
+ *   0.8.0 (2026-06-10) - Duplicate-agent install guard (RINST-1 #14):
+ *     - riFindExistingNode scans ALL nodes (db.GetAllType('node'), cross-group —
+ *       NOT gated by the operator's visible groups, since the duplicate may sit
+ *       in a group they cannot see, which is the incident) and matches the typed
+ *       host (hostname → name/rname/host ignoring domain; IP → host/ip exact).
+ *     - remoteInstall.run now hard-blocks a redundant push with error
+ *       'agent_exists' (fail-closed: scan failure → 'dup_check_failed', refuse).
+ *       Audit status 'blocked'. The foreign group name is NEVER leaked — it is
+ *       returned only when the operator can already see that group (existingGroup
+ *       set only if visible).
+ *     - remoteInstall.reachability returns an advisory { existing, existingVisible,
+ *       existingGroup } so the UI can warn before a TOTP is spent (non-fatal).
+ *     - replyError gains an optional meta object (merged into the error frame).
  *   0.7.0 (2026-06-04) - Role-default + per-user override enforce (RC-15.M.2):
  *     - hasSystemTerminalPermission / hasRemoteInstallPermission now resolve the
  *       effective flag as override (grants[user][flag], tri-state) ?? roleDefault
@@ -304,9 +317,9 @@ module.exports.remoraTerminalBridge = function (parent) {
         try { session.send(body); } catch (e) { /* ignore */ }
     }
 
-    function replyError(session, command, error) {
+    function replyError(session, command, error, meta) {
         try {
-            session.send({
+            session.send(Object.assign({
                 action: 'plugin',
                 plugin: PLUGIN_SHORT_NAME,
                 pluginaction: command.pluginaction || 'unknown',
@@ -314,7 +327,7 @@ module.exports.remoraTerminalBridge = function (parent) {
                 responseid: command.responseid || command.tag,
                 result: 'error',
                 error: String(error || 'remora_terminal_bridge_failed')
-            });
+            }, meta || {}));
         } catch (e) { /* ignore */ }
     }
 
@@ -610,6 +623,51 @@ module.exports.remoraTerminalBridge = function (parent) {
         return (ws.GetMeshRights(user, groupId) & MESHRIGHT_EDITMESH) !== 0;
     }
 
+    // RC-15.RINST-1 (#14) — does the typed install target already correspond to
+    // a registered node? Hostname targets match node.name / node.rname / node.host
+    // ignoring any domain suffix; IP targets match node.host / node.ip exactly.
+    function riTargetMatchesNode(target, node) {
+        var t = String(target || '').toLowerCase().trim();
+        if (!t || !node) return false;
+        var isIp = /^\d{1,3}(\.\d{1,3}){3}$/.test(t);
+        var fields = isIp ? [node.host, node.ip] : [node.name, node.rname, node.host];
+        var tShort = t.split('.')[0];
+        for (var i = 0; i < fields.length; i++) {
+            var c = fields[i];
+            if (!c) continue;
+            var cl = String(c).toLowerCase().trim();
+            if (!cl) continue;
+            if (cl === t) return true;
+            if (!isIp && cl.split('.')[0] === tShort && tShort.length > 0) return true;
+        }
+        return false;
+    }
+
+    // Scan ALL nodes (cross-group, NOT gated by the operator's visible groups —
+    // the duplicate may live in a group the operator cannot see, which is exactly
+    // the incident this guards) for an agent already registered for `target`.
+    // cb(err, match | null) where match = { node, visible, groupName }.
+    function riFindExistingNode(user, target, cb) {
+        var db = obj.meshServer && obj.meshServer.db;
+        if (!db || typeof db.GetAllType !== 'function') return cb(new Error('db_unavailable'));
+        db.GetAllType('node', function (err, nodes) {
+            if (err || !Array.isArray(nodes)) return cb(err || new Error('db_scan_failed'));
+            for (var i = 0; i < nodes.length; i++) {
+                var n = nodes[i];
+                if (!n || n.type !== 'node') continue;
+                if (!riTargetMatchesNode(target, n)) continue;
+                var ws = obj.meshServer && obj.meshServer.webserver;
+                var visible = isSuperAdmin(user) ||
+                    (ws && typeof ws.GetMeshRights === 'function' && n.meshid && (ws.GetMeshRights(user, n.meshid) !== 0));
+                // Only expose the group name when the operator may already see it;
+                // never leak a foreign group's name.
+                var groupName = (visible && ws && ws.meshes && ws.meshes[n.meshid] && ws.meshes[n.meshid].name) || null;
+                return cb(null, { node: n, visible: !!visible, groupName: groupName });
+            }
+            return cb(null, null);
+        });
+    }
+
     // Build the .msh policy + stream the per-group agent into a temp file.
     // Mirrors webserver.js handleAgentRequest (the native /meshagents path) for
     // the connectivity-critical fields. Optional domain agentcustomization
@@ -738,7 +796,17 @@ module.exports.remoraTerminalBridge = function (parent) {
                 var out = res.stdout || '';
                 var ping = /ping=True/i.test(out);
                 var winrm = /winrm=True/i.test(out);
-                reply(session, command, { reachable: ping, winrm: winrm });
+                // RC-15.RINST-1 (#14) — advisory only: warn the operator a node is
+                // already registered for this host before they spend a TOTP. A
+                // scan error here is non-fatal (the run path hard-blocks anyway).
+                riFindExistingNode(user, host, function (scanErr, match) {
+                    reply(session, command, {
+                        reachable: ping, winrm: winrm,
+                        existing: !!(match && !scanErr),
+                        existingVisible: match ? match.visible : undefined,
+                        existingGroup: (match && match.groupName) || undefined
+                    });
+                });
             });
         });
     }
@@ -783,6 +851,23 @@ module.exports.remoraTerminalBridge = function (parent) {
                 return replyError(session, command, 'not_configured');
             }
 
+            // RC-15.RINST-1 (#14) — block a redundant push if an agent is already
+            // registered for this host (possibly in a group the operator cannot
+            // see). Fail-closed: if the scan cannot complete, refuse rather than
+            // risk a duplicate install.
+            riFindExistingNode(user, host, function (scanErr, match) {
+                if (scanErr) {
+                    dispatchRiAudit(actor, { msg: 'Remote Install dup-check failed', actor: actor, host: host, group: groupId, status: 'error', detail: scanErr.message });
+                    return replyError(session, command, 'dup_check_failed');
+                }
+                if (match) {
+                    dispatchRiAudit(actor, { msg: 'Remote Install push blocked (agent already present)', actor: actor, host: host, group: groupId, status: 'blocked', existingVisible: match.visible });
+                    return replyError(session, command, 'agent_exists', { existingVisible: match.visible, existingGroup: match.groupName || undefined });
+                }
+                proceedInstall();
+            });
+
+            function proceedInstall() {
             riGenerateInstaller(groupId, installFlags, function (genErr, localExe) {
                 if (genErr || !localExe) {
                     dispatchRiAudit(actor, { msg: 'Remote Install installer-gen failed', actor: actor, host: host, group: groupId, status: 'error', detail: genErr && genErr.message });
@@ -801,6 +886,7 @@ module.exports.remoraTerminalBridge = function (parent) {
                     return replyError(session, command, 'install_failed');
                 }, 180000); // push can take a while: download already local, copy + -fullinstall
             });
+            } // proceedInstall
         });
     }
 
