@@ -37,6 +37,18 @@
  *   server → client (err): { result:'error', error:'<slug>' }
  *
  * Changelog:
+ *   0.9.0 (2026-06-10) - Disconnect device session (N.1 #12 part-2):
+ *     - New serveraction endDeviceSession: force-disconnect another user's live
+ *       session (kvm/terminal/files) on a node. Gated by the RemoraHQ flag
+ *       canManageDeviceSessions (resolveRemoraFlag, fail-closed; super-admin
+ *       implicit, grantable to e.g. department heads). RBAC defense-in-depth via
+ *       GetNodeWithRights (caller must SEE the node — no cross-group reach).
+ *     - The agent self-gates endtunnel: it only closes ANOTHER user's tunnel
+ *       when rights==0xFFFFFFFF (meshcore.js). After the flag check this handler
+ *       legitimately sends full rights, so a non-full-admin grantee can act while
+ *       a raw operator (real rights) cannot. Mirrors the native endtunnel wire
+ *       (action='msg' -> type='endtunnel'). Audited (status denied/success).
+ *     - Also syncs PLUGIN_VERSION (was 0.7.0, lagged config 0.8.0) to 0.9.0.
  *   0.8.0 (2026-06-10) - Duplicate-agent install guard (RINST-1 #14):
  *     - riFindExistingNode scans ALL nodes (db.GetAllType('node'), cross-group —
  *       NOT gated by the operator's visible groups, since the duplicate may sit
@@ -173,7 +185,7 @@ var fs = require('fs');
 var path = require('path');
 
 var PLUGIN_SHORT_NAME = 'remoraTerminalBridge';
-var PLUGIN_VERSION = '0.7.0';
+var PLUGIN_VERSION = '0.9.0';
 var ALLOWED_SHELLS = ['cmd', 'powershell', 'bash', 'zsh'];
 // 'operator' (RC-14.27) is a Windows admin shell (protocol 1/6) that the agent
 // re-launches under the calling operator's AD identity via S4U2Self. Server-side
@@ -223,6 +235,8 @@ var RI_BLOB_RE = /^[A-Za-z0-9+/=]{1,8192}$/;
 var RI_GROUP_RE = /^mesh\/[A-Za-z0-9.\-]*\/[A-Za-z0-9@$_\-]{1,128}$/;
 var RI_INSTALL_AGENTID = 4; // MeshService64.exe — signed Windows x86-64 service.
 var PERMISSION_REMOTE_INSTALL = 'canRemoteInstall';
+// N.1 (#12) — gates the operator "disconnect another user's session" action.
+var PERMISSION_MANAGE_SESSIONS = 'canManageDeviceSessions';
 // Native /meshagents installer download requires this right on the target
 // device group (webserver.js handleMeshAgentRequest: GetMeshRights & 1).
 // Remote Install mirrors it so canRemoteInstall cannot cross into groups the
@@ -890,11 +904,72 @@ module.exports.remoraTerminalBridge = function (parent) {
         });
     }
 
+    // N.1 (#12) part-2 — disconnect another user's live session on a node.
+    // Gated by the RemoraHQ flag canManageDeviceSessions (super-admin implicit,
+    // grantable to e.g. department heads). The agent itself only force-closes
+    // ANOTHER user's tunnel when rights == 0xFFFFFFFF (meshcore endtunnel), so a
+    // raw operator cannot bypass this — only this handler, AFTER verifying the
+    // flag, sends the elevated rights that authorise the disconnect.
+    function handleEndDeviceSession(command, dbGet, session) {
+        var user = dbGet && dbGet.user;
+        var actor = user ? user._id : null;
+        if (!actor) return replyError(session, command, 'auth_required');
+
+        var nodeId = String(command.nodeId || '');
+        var protocol = String(command.protocol || '');
+        var xuserid = String(command.xuserid || '');
+        if (!nodeId || nodeId.indexOf('node//') !== 0) return replyError(session, command, 'invalid_nodeId');
+        if (['kvm', 'terminal', 'files'].indexOf(protocol) === -1) return replyError(session, command, 'invalid_protocol');
+        if (!xuserid || xuserid.indexOf('user/') !== 0) return replyError(session, command, 'invalid_target');
+
+        resolveRemoraFlag(user, PERMISSION_MANAGE_SESSIONS, function (allowed) {
+            if (!allowed) {
+                dispatchAudit(actor, { msg: 'Disconnect session denied: missing canManageDeviceSessions', nodeid: nodeId, target: xuserid, protocol: protocol, actor: actor, status: 'denied' });
+                return replyError(session, command, 'permission_denied');
+            }
+            var web = obj.meshServer && obj.meshServer.webserver;
+            if (!web || typeof web.GetNodeWithRights !== 'function' || !web.wsagents) {
+                return replyError(session, command, 'server_api_unavailable');
+            }
+            // RBAC defense-in-depth: the caller must be able to SEE the target
+            // node. The flag does not grant cross-group reach (discipline of #14).
+            var domainid = actor.split('/')[1] || '';
+            var domain = (obj.meshServer.config && obj.meshServer.config.domains &&
+                (obj.meshServer.config.domains[domainid] || obj.meshServer.config.domains[''])) || { id: domainid };
+            web.GetNodeWithRights(domain, user, nodeId, function (node, rights, visible) {
+                if (node == null || !visible) {
+                    dispatchAudit(actor, { msg: 'Disconnect session denied: node not visible', nodeid: nodeId, target: xuserid, actor: actor, status: 'denied' });
+                    return replyError(session, command, 'permission_denied');
+                }
+                var agent = web.wsagents[nodeId];
+                if (!agent || typeof agent.send !== 'function') {
+                    return replyError(session, command, 'agent_offline');
+                }
+                try {
+                    // Mirrors the native endtunnel command (meshcore switch
+                    // action='msg' -> type='endtunnel'); nodeid is implied by the
+                    // agent connection. rights=0xFFFFFFFF authorises closing
+                    // another user's tunnel — justified by the flag check above.
+                    agent.send(JSON.stringify({
+                        action: 'msg', type: 'endtunnel',
+                        xuserid: xuserid, protocol: protocol, guestname: null,
+                        userid: actor, rights: 0xFFFFFFFF
+                    }));
+                } catch (e) {
+                    return replyError(session, command, 'route_failed');
+                }
+                dispatchAudit(actor, { msg: 'Disconnected device session', nodeid: nodeId, target: xuserid, protocol: protocol, actor: actor, status: 'success' });
+                return reply(session, command, { ok: true });
+            });
+        });
+    }
+
     obj.serveraction = function (command, dbGet, ws) {
         var session = dbGet || ws;
         if (!session || typeof session.send !== 'function') return;
 
         var action = String(command.pluginaction || '');
+        if (action === 'endDeviceSession') return handleEndDeviceSession(command, dbGet, session);
         // RC-15.13 — Remote Install cred-vault actions (super-admin-only, gated
         // inside each handler). Kept ahead of the terminal 'open' path so the
         // existing flow below is untouched.
