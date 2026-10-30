@@ -119,9 +119,9 @@ test('install permission does not grant Push Account administration', async () =
     for (const action of ['setAccount', 'testAccount', 'accountStatus']) assert.equal((await f.request({ pluginaction: 'remoteInstall.' + action })).error, 'forbidden');
     assert.equal(f.reads(), 0); assert.equal(f.spawns.length, 0);
 });
-test('Operator and SYSTEM terminal opens still require TOTP', async () => {
+test('retired terminal modes are disabled independently of Remote Install', async () => {
     const f = fixture({ flags: { canUseSystemTerminal: true } });
     for (const context of ['operator', 'system']) {
-        assert.equal((await f.request({ pluginaction: 'open', nodeId: 'node//fixture', shell: 'cmd', context })).error, '2fa-failed');
+        assert.equal((await f.request({ pluginaction: 'open', nodeId: 'node//fixture', shell: 'cmd', context })).error, 'terminal_mode_disabled');
     }
 });

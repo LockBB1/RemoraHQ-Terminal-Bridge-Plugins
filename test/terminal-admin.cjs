@@ -6,102 +6,51 @@ const path = require('node:path');
 const vm = require('node:vm');
 const source = fs.readFileSync(path.join(__dirname, '../remoraTerminalBridge.js'), 'utf8');
 const actor = 'user//fixture', nodeId = 'node//fixture';
-
-function fixture(options = {}) {
-    const audits = [], cookies = [], bindings = [];
-    const user = { _id: actor, domain: '', siteadmin: 0, links: { 'ugrp//operator': {} }, ...options.user };
-    const module = { exports: {} };
-    const fakeRequire = name => {
-        if (name === 'crypto' || name === 'path') return require('node:' + name);
-        if (name === 'fs') return new Proxy({}, { get() { throw new Error('No filesystem effects'); } });
-        throw new Error('Unexpected dependency');
-    };
-    fakeRequire.resolve = () => { throw new Error('No authenticator available'); };
-    vm.runInNewContext(source, { module, require: fakeRequire, Buffer, setTimeout, clearTimeout, console: { log() {} } });
-    let finishAuth;
-    const webserver = {
-        users: { [actor]: user }, userGroups: { 'ugrp//operator': { name: 'RemoraHQ Operators' } },
-        GetNodeWithRights(_domain, _user, id, cb) { cb(id === nodeId ? { _id: nodeId, meshid: 'mesh//fixture' } : null, options.rights ?? 8, options.visible !== false); },
-        authenticate(name, password, domain, cb) {
-            bindings.push({ name, password, domain });
-            finishAuth = () => cb(options.authError ? new Error('Fixture authentication failed') : null, options.returnedId ?? (password === 'fixture-password' ? actor : null));
-            if (!options.deferAuth) finishAuth();
-        },
-    };
-    if (options.noAuthenticate) delete webserver.authenticate;
-    const engine = {
-        webserver, config: { domains: { '': { id: '', ...options.domain } } },
-        loginCookieEncryptionKey: 'fixture', encodeCookie(data) { cookies.push(data); return 'fixture-cookie'; },
-        db: { Get(_id, cb) { cb(null, [{ grants: { [actor]: { canUseSystemTerminal: true } } }]); } },
-        DispatchEvent(_targets, _source, event) { audits.push(event); },
-        pluginHandler: { plugins: { remoraAuditor: { serveraction(_command, session) { session.send({ auditorUserIds: options.auditor ? [actor] : [] }); } } } },
-    };
-    const plugin = module.exports.remoraTerminalBridge({ parent: engine });
-    let session;
-    function request(command = {}, who = user) {
-        return new Promise(resolve => {
-            session = { user: who, send(value) { resolve(JSON.parse(JSON.stringify(value))); } };
-            plugin.serveraction({ pluginaction: 'openAdmin', nodeId, shell: 'cmd', context: 'operator', password: 'fixture-password', ...command }, session);
-        });
-    }
-    return { request, audits, cookies, bindings, webserver, user, finish: () => finishAuth(), retire: () => { session.user = null; } };
+function fixture(superAdmin = false) {
+ const cookies = [], checks = [];
+ const user = { _id: actor, domain: '', siteadmin: superAdmin ? 0xFFFFFFFF : 0, otpsecret: 'fixture', links: { 'ugrp//fixture': {} } };
+ const fakeRequire = name => {
+  if (name === 'crypto' || name === 'path') return require('node:' + name);
+  if (name === 'fs') return new Proxy({}, { get() { throw Error('No filesystem effects'); } });
+  if (name === 'fixture-otplib') return { verifySync() { checks.push('totp'); return { valid: true }; } };
+  throw Error('Unexpected dependency');
+ };
+ fakeRequire.resolve = () => 'fixture-otplib';
+ const module = { exports: {} };
+ vm.runInNewContext(source, { module, require: fakeRequire, Buffer, setTimeout, clearTimeout, console: { log() {} } });
+ const engine = {
+  webPublicPath: 'fixture', loginCookieEncryptionKey: 'fixture', encodeCookie(data) { cookies.push(data); return 'fixture-cookie'; },
+  db: { Get(_id, cb) { cb(null, [{ grants: { [actor]: { canUseSystemTerminal: true } }, roleDefaults: { operator: { canUseSystemTerminal: true } } }]); } },
+  config: { domains: { '': { id: '' } } }, DispatchEvent() {},
+  webserver: { users: { [actor]: user }, userGroups: { 'ugrp//fixture': { name: 'RemoraHQ Operators' } },
+   GetNodeWithRights(_d, _u, id, cb) { cb({ _id: id }, 8, true); },
+   authenticate(_name, _password, _domain, cb) { checks.push('password'); cb(null, actor); } },
+ };
+ const plugin = module.exports.remoraTerminalBridge({ parent: engine });
+ function request(command = {}, who = user) {
+  let response; plugin.serveraction({ pluginaction: 'open', nodeId, shell: 'cmd', context: 'user', ...command }, { user: who, send(value) { response = value; } });
+  assert(response); return response;
+ }
+ return { request, cookies, checks };
 }
-
-for (const shell of ['cmd', 'powershell']) test('Admin ' + shell + ' verifies this account before issuing the unchanged operator context', async () => {
-    const f = fixture({ deferAuth: true });
-    const opening = f.request({ shell });
-    assert.equal(f.bindings.length, 1); assert.equal(f.cookies.length, 0);
-    f.finish(); const result = await opening;
-    assert.equal(result.result, 'ok'); assert.equal(result.protocol, shell === 'cmd' ? 1 : 6);
-    assert.equal(result.agentTunnel.remoraOperator, true); assert.equal(f.cookies.length, 1);
-    assert.equal(f.bindings[0].name, 'fixture');
-    assert.equal(JSON.stringify(result).includes('fixture-password'), false);
-    assert.equal(JSON.stringify(f.audits).includes('fixture-password'), false);
+for (const superAdmin of [false, true]) {
+ for (const command of [
+  { context: 'system', totpToken: '123456' }, { context: 'operator', totpToken: '123456' }, { context: 'admin' },
+  { requirePassword: true }, { password: 'fixture-password' }, { protocol: 6 }, { remoraOperator: true },
+ ]) test('legacy terminal input is disabled even with old grants, superAdmin=' + superAdmin + ' input=' + Object.keys(command).join(','), () => {
+  const f = fixture(superAdmin); const result = f.request(command);
+  assert.equal(result.error, 'terminal_mode_disabled'); assert.equal(f.cookies.length, 0); assert.equal(f.checks.length, 0);
+ });
+ test('Admin API is unavailable before any password verification, superAdmin=' + superAdmin, () => {
+  const f = fixture(superAdmin); const result = f.request({ pluginaction: 'openAdmin', context: 'operator', password: 'fixture-password' });
+  assert.equal(result.error, 'terminal_admin_unavailable'); assert.equal(f.cookies.length, 0); assert.equal(f.checks.length, 0);
+ });
+}
+for (const shell of ['cmd', 'powershell']) test('User ' + shell + ' retains native user protocol only', () => {
+ const f = fixture(); const result = f.request({ shell });
+ assert.equal(result.result, 'ok'); assert.equal(result.protocol, shell === 'powershell' ? 9 : 8);
+ assert.equal(result.agentTunnel.remoraOperator, undefined); assert.equal(f.cookies.length, 1); assert.equal(f.checks.length, 0);
 });
-
-for (const [label, options, command, error] of [
-    ['missing password', {}, { password: undefined }, 'password_required'],
-    ['wrong password', {}, { password: 'wrong' }, 'password_failed'],
-    ['another account', { returnedId: 'user//other' }, {}, 'password_failed'],
-    ['auth failure', { authError: true }, {}, 'password_failed'],
-    ['no verifier', { noAuthenticate: true }, {}, 'password_unavailable'],
-    ['viewer', { user: { links: {} } }, {}, 'permission_denied'],
-    ['auditor override', { auditor: true }, {}, 'permission_denied'],
-    ['locked account', { user: { siteadmin: 32 } }, {}, 'permission_denied'],
-    ['no control rights', { rights: 0 }, {}, 'permission_denied'],
-    ['terminal prohibited', { rights: 8 | 512 }, {}, 'permission_denied'],
-    ['view-only restriction', { rights: 8 | 256 }, {}, 'permission_denied'],
-    ['hidden device', { visible: false }, {}, 'permission_denied'],
-    ['cross-domain device', {}, { nodeId: 'node/other/fixture' }, 'invalid_nodeId'],
-    ['device query injection', {}, { nodeId: 'node//fixture&p=1' }, 'invalid_nodeId'],
-    ['oversized password', {}, { password: 'x'.repeat(1025) }, 'password_required'],
-    ['system context', {}, { context: 'system' }, 'invalid_context'],
-    ['unsupported shell', {}, { shell: 'bash' }, 'unsupported_shell_context'],
-    ['SSPI domain', { domain: { auth: 'sspi' } }, {}, 'password_unavailable'],
-]) test('direct Admin API refuses ' + label + ' without issuing a relay cookie', async () => {
-    const f = fixture(options); const result = await f.request(command);
-    assert.equal(result.error, error); assert.equal(f.cookies.length, 0);
-});
-
-test('requires an authenticated caller', async () => {
-    const f = fixture(); assert.equal((await f.request({}, null)).error, 'auth_required'); assert.equal(f.bindings.length, 0);
-});
-test('uses the configured LDAP account handle and requires the same returned account', async () => {
-    const f = fixture({ domain: { auth: 'ldap' }, user: { email: 'fixture@example.invalid' } });
-    assert.equal((await f.request()).result, 'ok'); assert.equal(f.bindings[0].name, 'fixture');
-});
-test('limits password checks to five per actor per minute, including successes', async () => {
-    const f = fixture(); for (let n = 0; n < 5; n++) assert.equal((await f.request()).result, 'ok');
-    assert.equal((await f.request()).error, 'rate_limited'); assert.equal(f.bindings.length, 5);
-});
-for (const revoke of ['session', 'rights', 'lock']) test('rechecks ' + revoke + ' after async password verification', async () => {
-    const f = fixture({ deferAuth: true }); const opening = f.request();
-    if (revoke === 'session') f.retire();
-    if (revoke === 'rights') f.webserver.GetNodeWithRights = (_domain, _user, _id, cb) => cb(null, 0, false);
-    if (revoke === 'lock') f.user.siteadmin = 32;
-    f.finish(); assert.notEqual((await opening).result, 'ok'); assert.equal(f.cookies.length, 0);
-});
-test('Admin password never grants the existing Operator or SYSTEM TOTP cache', async () => {
-    const f = fixture(); assert.equal((await f.request()).result, 'ok');
-    for (const context of ['operator', 'system']) assert.equal((await f.request({ pluginaction: 'open', context, requirePassword: true })).error, '2fa-failed');
+test('User still requires an authenticated session', () => {
+ const f = fixture(); assert.equal(f.request({}, null).error, 'auth_required'); assert.equal(f.cookies.length, 0);
 });

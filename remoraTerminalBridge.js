@@ -187,23 +187,10 @@ var fs = require('fs');
 var path = require('path');
 
 var PLUGIN_SHORT_NAME = 'remoraTerminalBridge';
-var PLUGIN_VERSION = '0.11.0';
+var PLUGIN_VERSION = '0.12.0';
 var ALLOWED_SHELLS = ['cmd', 'powershell', 'bash', 'zsh'];
-// 'operator' (RC-14.27) is a Windows admin shell (protocol 1/6) that the agent
-// re-launches under the calling operator's AD identity via S4U2Self. Server-side
-// it is gated exactly like 'system' (TOTP). The agent decides operator-vs-SYSTEM
-// from the browser `xoptions.remoraOperator` flag + the server-trusted username.
-var ALLOWED_CONTEXTS = ['user', 'system', 'operator'];
-
-// RC-15.A.1 — server-side RBAC enforcement of the SYSTEM terminal.
-// The `remoraPermissions` site-wide doc (owned by remoraCore) stores grants as
-// `{ <userid>: { canUseSystemTerminal: true } }`. Super-admins implicitly hold
-// every flag and are never stored. Until now `canUseSystemTerminal` was a UI-only
-// gate (TerminalToolbar hid the option) — a raw `context=system` command sent past
-// the UI still reached here and was issued an rauth cookie. We now verify the flag
-// server-side BEFORE issuing the cookie, so the UI is no longer the authority.
+// Only native User terminal contexts are issued by this plugin.
 var REMORA_PERMISSIONS_DOC_ID = 'remoraPermissions';
-var PERMISSION_SYSTEM_TERMINAL = 'canUseSystemTerminal';
 function isSuperAdmin(user) { return !!user && user.siteadmin === 0xFFFFFFFF; }
 
 // RC-15.M.2 — server-side RemoraHQ role derivation for role-default flag
@@ -253,64 +240,8 @@ var riRunTimes = Object.create(null);
 var RI_REACH_MAX = 30;
 var riReachTimes = Object.create(null);
 
-// v0.2.0 (RC-13.19.1) — server-side TOTP grant cache.
-//
-// The frontend caches a "TOTP accepted" flag per agent for 15 min so the
-// user is not re-prompted for an authenticator code on every reconnect
-// to the same admin shell within that window. Before v0.2.0 the server
-// always required a fresh totpToken regardless, which meant every
-// post-cache reconnect failed with `2fa-failed`. We now keep a parallel
-// grant Map here so the server-side check honours the same TTL.
-//
-// Key: '<actor>|<nodeId>'  (e.g. 'user//abc|node//xyz')
-// Value: epoch-ms when TOTP was last verified for that pair.
-//
-// In-memory only — restarting Mesh clears all grants, which is the
-// safer default for a security gate.
-var totpGrantCache = Object.create(null);
-// Per-process, per-account budget; includes successful Admin opens. No password cache.
-var adminPasswordAttempts = Object.create(null);
-var TOTP_GRANT_TTL_MS = 15 * 60 * 1000;
-
-function totpGrantKey(actor, nodeId) { return String(actor) + '|' + String(nodeId); }
-
-function hasValidTotpGrant(actor, nodeId) {
-    var k = totpGrantKey(actor, nodeId);
-    var ts = totpGrantCache[k];
-    if (!ts) return false;
-    if (Date.now() - ts >= TOTP_GRANT_TTL_MS) { delete totpGrantCache[k]; return false; }
-    return true;
-}
-
-function markTotpGrant(actor, nodeId) {
-    totpGrantCache[totpGrantKey(actor, nodeId)] = Date.now();
-}
-
-// Mesh native terminal protocol numbers — see meshcore.js around lines
-// 2642 (PowerShell dispatch), 2675-2734 (cmd/sh dispatch by uid), and the
-// terminal protocol allow-list in meshrelay.js:584 (msgid 14, the "Started
-// terminal session" audit family covers [1,6,8,9]).
-//
-//   1 = admin shell        (Windows cmd as SYSTEM     | Linux sh as root)
-//   6 = admin PowerShell   (Windows PowerShell as SYSTEM — Windows only)
-//   8 = user shell         (Windows cmd as console user| Linux sh as console user via consoleUid)
-//   9 = user PowerShell    (Windows PowerShell as console user — Windows only)
-//
-// Linux note: Mesh does not differentiate bash vs zsh — it uses the user's
-// default $SHELL. We accept bash|zsh in the API for forward-compat and UX
-// parity, but they map to the same protocol numbers as a generic shell.
-var PROTOCOL_MAP = {
-    'cmd|user':         8,
-    'cmd|system':       1,
-    'cmd|operator':     1,
-    'powershell|user':  9,
-    'powershell|system': 6,
-    'powershell|operator': 6,
-    'bash|user':        8,
-    'bash|system':      1,
-    'zsh|user':         8,
-    'zsh|system':       1
-};
+// Native logged-in user protocols; no agent/service-context terminal mapping.
+var PROTOCOL_MAP = { 'cmd|user': 8, 'powershell|user': 9, 'bash|user': 8, 'zsh|user': 8 };
 
 module.exports.remoraTerminalBridge = function (parent) {
     var obj = {};
@@ -352,17 +283,6 @@ module.exports.remoraTerminalBridge = function (parent) {
     function newSessionId() {
         // 16-byte random → 32-char hex. Plenty for a relay correlation token.
         return crypto.randomBytes(16).toString('hex');
-    }
-
-    function verifyTotp(user, token) {
-        if (!user || !user.otpsecret) return false;
-        if (typeof token !== 'string' || !/^\d{6}$/.test(token)) return false;
-        try {
-            var otplib = require(require.resolve('otplib', { paths: [path.dirname(obj.meshServer.webPublicPath)] }));
-            return otplib.verifySync({ secret: user.otpsecret, token: token, epochTolerance: 60 }).valid === true;
-        } catch (e) {
-            return false;
-        }
     }
 
     // RC-15.M.2 — derive a user's RemoraHQ role server-side (super_admin handled
@@ -410,11 +330,6 @@ module.exports.remoraTerminalBridge = function (parent) {
             var rd = roleDefaults[deriveRemoraRole(user)] || {};
             return cb(rd[flag] === true);
         });
-    }
-
-    // RC-15.A.1 — SYSTEM-terminal gate; now resolves role-default + override (M.2).
-    function hasSystemTerminalPermission(user, cb) {
-        resolveRemoraFlag(user, PERMISSION_SYSTEM_TERMINAL, cb);
     }
 
     function dispatchAudit(actor, payload) {
@@ -972,26 +887,23 @@ module.exports.remoraTerminalBridge = function (parent) {
         if (action === 'remoteInstall.testAccount') return handleRiTestAccount(command, dbGet, session);
         if (action === 'remoteInstall.reachability') return handleRiReachability(command, dbGet, session);
         if (action === 'remoteInstall.run') return handleRiRun(command, dbGet, session);
-        var isAdminOpen = action === 'openAdmin';
-        if (action !== 'open' && !isAdminOpen) return replyError(session, command, 'unknown_pluginaction');
+        if (action === 'openAdmin') { delete command.password; return replyError(session, command, 'terminal_admin_unavailable'); }
+        if (action !== 'open') return replyError(session, command, 'unknown_pluginaction');
 
         var nodeId = (command.nodeId != null) ? String(command.nodeId) : '';
         var shell = String(command.shell || '');
-        var context = String(command.context || 'user');
-        var totpToken = command.totpToken;
+        var context = command.context === undefined ? 'user' : command.context;
+        if (context !== 'user' || ['password', 'totpToken', 'requirePassword', 'remoraOperator', 'protocol'].some(function (key) { return Object.prototype.hasOwnProperty.call(command, key); })) {
+            dispatchAudit(null, { msg: 'Disabled terminal mode rejected', status: 'denied' });
+            return replyError(session, command, 'terminal_mode_disabled');
+        }
 
-        if (!nodeId || (isAdminOpen ? (nodeId.length > 128 || !/^node\/[^/]*\/[A-Za-z0-9@$_.-]+$/.test(nodeId)) : nodeId.indexOf('node//') !== 0)) {
+        if (!nodeId || nodeId.indexOf('node//') !== 0) {
             return replyError(session, command, 'invalid_nodeId');
         }
         if (ALLOWED_SHELLS.indexOf(shell) === -1) {
             return replyError(session, command, 'invalid_shell');
         }
-        if (ALLOWED_CONTEXTS.indexOf(context) === -1) {
-            return replyError(session, command, 'invalid_context');
-        }
-        if (isAdminOpen && context !== 'operator') return replyError(session, command, 'invalid_context');
-        if (isAdminOpen && shell !== 'cmd' && shell !== 'powershell') return replyError(session, command, 'unsupported_shell_context');
-
         var protocol = PROTOCOL_MAP[shell + '|' + context];
         if (typeof protocol !== 'number') {
             return replyError(session, command, 'unsupported_shell_context');
@@ -1003,137 +915,6 @@ module.exports.remoraTerminalBridge = function (parent) {
         if (!actor) {
             return replyError(session, command, 'auth_required');
         }
-        if (isAdminOpen) {
-            // Password verification authorizes only THIS API invocation. Native relay
-            // remains a separate path; no claim of native/agent enforcement is made.
-            var password = command.password;
-            delete command.password;
-            var web = obj.meshServer && obj.meshServer.webserver;
-            var domainId = user.domain || '';
-            var domain = obj.meshServer && obj.meshServer.config && obj.meshServer.config.domains && obj.meshServer.config.domains[domainId];
-            if (nodeId.split('/')[1] !== domainId) return replyError(session, command, 'invalid_nodeId');
-            if (typeof password !== 'string' || !password || password.length > 1024) return replyError(session, command, 'password_required');
-            if (!web || typeof web.authenticate !== 'function' || !domain || (domain.auth && domain.auth !== 'default' && domain.auth !== 'ldap')) return replyError(session, command, 'password_unavailable');
-
-            checkAdminRights(function (allowed) {
-                if (!allowed) return denyAdmin('permission_denied');
-                var now = Date.now();
-                var attempts = (adminPasswordAttempts[actor] || []).filter(function (at) { return now - at < 60000; });
-                adminPasswordAttempts[actor] = attempts;
-                if (attempts.length >= 5) return denyAdmin('rate_limited');
-                attempts.push(now);
-                // Local accounts use their native login key. LDAP follows the existing
-                // Core email-local-part convention; mismatches fail closed by returned id.
-                var username = user._id.split('/')[2];
-                if (domain.auth === 'ldap' && typeof user.email === 'string' && user.email.indexOf('@') > 0) username = user.email.split('@')[0];
-                try {
-                    web.authenticate(username, password, domain, function (err, returnedId) {
-                        if (err || returnedId !== actor) return denyAdmin('password_failed');
-                        // Authentication can be asynchronous; re-read rights and account
-                        // state before issuing a cookie. No reusable password/TOTP grant.
-                        checkAdminRights(function (stillAllowed) {
-                            if (!stillAllowed) return denyAdmin('permission_denied');
-                            user = web.users[actor];
-                            proceedOpen();
-                        });
-                    });
-                } catch (e) { denyAdmin('password_unavailable'); }
-                finally { password = null; }
-            });
-            return;
-        }
-
-        function denyAdmin(error) {
-            password = null;
-            dispatchAudit(actor, { msg: 'Admin terminal open denied', nodeid: nodeId, shell: shell, context: context, actor: actor, status: 'denied', reason: error });
-            replyError(session, command, error);
-        }
-
-        function currentAdminUser() {
-            var current = web.users && web.users[actor];
-            if (!session.user || session.user._id !== actor || !current || (!isSuperAdmin(current) && (current.siteadmin & SITERIGHT_LOCKED))) return null;
-            var role = deriveRemoraRole(current);
-            if (role !== 'super_admin' && role !== 'administrator' && role !== 'operator') return null;
-            // Auditor is an explicit override over operator marker membership.
-            var auditor = obj.meshServer.pluginHandler && obj.meshServer.pluginHandler.plugins && obj.meshServer.pluginHandler.plugins.remoraAuditor;
-            if (role === 'operator' && auditor) {
-                var auditorIds = null;
-                try { auditor.serveraction({ pluginaction: 'list' }, { user: current, send: function (body) { if (Array.isArray(body.auditorUserIds)) auditorIds = body.auditorUserIds; } }); }
-                catch (e) { return null; }
-                if (!auditorIds || auditorIds.indexOf(actor) >= 0) return null;
-            }
-            return current;
-        }
-
-        function checkAdminRights(done) {
-            var current = currentAdminUser();
-            if (!current) return done(false);
-            if (typeof web.GetNodeWithRights !== 'function') return done(false);
-            try {
-                web.GetNodeWithRights(domain, current, nodeId, function (node, rights, visible) {
-                    done(!!currentAdminUser() && !!node && node._id === nodeId && visible === true && typeof rights === 'number' && (rights & 8) !== 0
-                        && (rights === 0xFFFFFFFF || (rights & (512 | 256)) === 0));
-                });
-            } catch (e) { done(false); }
-        }
-
-        // RC-15.A.1 — server-enforce the SYSTEM terminal BEFORE issuing the
-        // rauth cookie. context='system' requires canUseSystemTerminal (or
-        // super-admin); without it a raw command past the UI is denied here.
-        // user/operator are unaffected (operator keeps its own TOTP tier).
-        // The rest of the open flow runs in proceedOpen() so it can wait on the
-        // async grant lookup; the function is hoisted so it's callable above.
-        if (context === 'system') {
-            hasSystemTerminalPermission(user, function (allowed) {
-                if (!allowed) {
-                    dispatchAudit(actor, {
-                        msg: 'Terminal open denied: missing canUseSystemTerminal',
-                        nodeid: nodeId,
-                        shell: shell,
-                        context: context,
-                        protocol: protocol,
-                        actor: actor,
-                        status: 'denied'
-                    });
-                    return replyError(session, command, 'permission_denied');
-                }
-                proceedOpen();
-            });
-        } else {
-            proceedOpen();
-        }
-        return;
-
-        function proceedOpen() {
-        // SYSTEM context requires either a fresh TOTP token OR a still-valid
-        // grant from a prior successful TOTP for this (actor, nodeId). The
-        // grant TTL mirrors the frontend cache so the UI's "skip prompt"
-        // assumption no longer leads to a server-side rejection
-        // (RC-13.19.1 fix; before v0.2.0 every reconnect failed with
-        // 2fa-failed because the client cached the grant but the server
-        // demanded a fresh code each time).
-        if (!isAdminOpen && (context === 'system' || context === 'operator')) {
-            var grantOk = hasValidTotpGrant(actor, nodeId);
-            if (!grantOk) {
-                if (!verifyTotp(user, totpToken)) {
-                    dispatchAudit(actor, {
-                        msg: 'Terminal open denied: invalid TOTP for SYSTEM context',
-                        nodeid: nodeId,
-                        shell: shell,
-                        context: context,
-                        protocol: protocol,
-                        actor: actor,
-                        status: 'denied'
-                    });
-                    return replyError(session, command, '2fa-failed');
-                }
-                markTotpGrant(actor, nodeId);
-            }
-            // else: grant still valid — TOTP not requested, audit-flag below
-            // distinguishes the two paths so compliance reviews can see how
-            // each system-context open was authorised.
-        }
-
         // Mesh agent-side rauth cookie. Mesh's relay handler validates the
         // browser-issued `?rauth=<cookie>` query via
         //   meshServer.decodeCookie(rauth, loginCookieEncryptionKey, 240)
@@ -1157,10 +938,6 @@ module.exports.remoraTerminalBridge = function (parent) {
         }
 
         var sessionId = newSessionId();
-        // RC-14.27 (v0.3.3): the operator identity is NOT carried by the plugin.
-        // The agent derives it from the server-authenticated `httprequest.username`
-        // (Mesh sets command.username = user.name natively in meshrelay.js). The
-        // plugin only flags operator mode below; it cannot and must not choose WHO.
         // Browser-side relay URL. `browser=1` flags this as the user end of a
         // tunnel pair; auth comes from the same-origin session cookie. The
         // agent end is opened only after the caller dispatches the tunnel msg
@@ -1189,7 +966,7 @@ module.exports.remoraTerminalBridge = function (parent) {
             actor: actor,
             sessionId: sessionId,
             status: 'success',
-            authorization: isAdminOpen ? 'account-password' : 'existing-terminal-policy'
+            authorization: 'native-user-context'
         });
 
         reply(session, command, {
@@ -1198,11 +975,9 @@ module.exports.remoraTerminalBridge = function (parent) {
             protocol: protocol,
             agentTunnel: {
                 nodeId: nodeId,
-                value: agentTunnelValue,
-                remoraOperator: context === 'operator'
+                value: agentTunnelValue
             }
         });
-        } // proceedOpen
     };
 
     return obj;
