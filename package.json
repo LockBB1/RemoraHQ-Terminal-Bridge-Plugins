@@ -3,6 +3,9 @@
   "version": "0.6.1",
   "description": "RemoraHQ Terminal Bridge MeshCentral plugin",
   "main": "remoraTerminalBridge.js",
+  "scripts": {
+    "test": "node --test test/remote-install.cjs test/terminal-admin.cjs"
+  },
   "license": "Apache-2.0",
   "repository": {
     "type": "git",

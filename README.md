@@ -88,6 +88,57 @@ Every open attempt dispatches:
 
 Visible in `Audit Log` page in RemoraHQ.
 
+## Admin terminal password API
+
+Native plugin version `0.11.0` adds `pluginaction: "openAdmin"` with `nodeId`,
+`shell: "cmd" | "powershell"`, `context: "operator"` and `password`. This is the
+password of the already authenticated MeshCentral/RemoraHQ account. Every open
+checks it through MeshCentral `webserver.authenticate`, requires the returned
+user id to match the caller, then rechecks the active caller, role and node rights
+before issuing the terminal response. No password or TOTP grant is cached.
+The per-account password budget is five attempts per minute per server process,
+including successful opens; it is not a shared cluster limiter.
+
+The Admin API allows super-admin, administrator and operator roles, denies the
+auditor override, requires a visible target with remote control rights and
+rejects view-only/terminal-prohibited rights. Full native node-admin rights retain
+their native exception. Locked accounts and retired sessions fail closed.
+Local login keys and LDAP's existing Core email-local-part convention are
+supported; a different LDAP naming convention can reject a correct password.
+SSPI and other external authentication modes are unsupported by this API.
+
+The execution context remains `operator`, using the existing native protocols
+`1/6`. The password is never sent to the agent or written to audit/replies.
+This check protects this plugin API only: native MeshCentral relay access keeps
+its existing policy and can bypass the RemoraHQ Admin flow. Native/overlay and
+agent logon behavior are unchanged. Device Policy restrictions still apply.
+
+The matching SPA applies the previous route MFA check before each non-Admin
+connect when its entry proof is stale. Operator/SYSTEM keep their separate TOTP
+checks. Admin password verification neither creates nor refreshes an MFA proof.
+Deploy this plugin with the matching SPA: old plugins reject `openAdmin`; old
+SPAs continue their previous flow. The setup snapshot is not updated here.
+
+## Remote Install
+
+Native plugin version `0.10.0` accepts `remoteInstall.run` with `host`,
+`groupId` and optional `installFlags`, without a TOTP field or grant. The
+authenticated caller still needs `canRemoteInstall` and install rights on the
+target Machine Group. Host/group validation, the per-actor push limit,
+fail-closed duplicate detection, sealed local push credentials and audit remain.
+Push Account administration and terminal TOTP checks are separate and unchanged.
+
+Deploy this plugin and the matching SPA together. An earlier plugin can reject
+the new SPA with `2fa-failed`; an earlier SPA still asks for TOTP even though
+this run handler no longer validates it. Mixed versions do not provide the new
+policy consistently. The setup package snapshot and actual loaded server plugin
+must be checked separately; editing this checkout does not update either.
+
+`npm test` exercises the real dispatcher with in-memory filesystem, database,
+installer and process fixtures. It never runs PowerShell or WinRM and does not
+prove DPAPI decryption, a live agent install or deployment readiness. The npm
+package metadata version is independent of the native `config.json` version.
+
 ## Install (development)
 
 ```powershell

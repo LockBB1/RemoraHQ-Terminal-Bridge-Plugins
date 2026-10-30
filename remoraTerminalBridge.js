@@ -37,6 +37,8 @@
  *   server → client (err): { result:'error', error:'<slug>' }
  *
  * Changelog:
+ *   0.10.0 - Remote Install no longer requires a TOTP step-up. Permission,
+ *     per-group authorization, rate limits, duplicate checks and DPAPI remain.
  *   0.9.0 (2026-06-10) - Disconnect device session (N.1 #12 part-2):
  *     - New serveraction endDeviceSession: force-disconnect another user's live
  *       session (kvm/terminal/files) on a node. Gated by the RemoraHQ flag
@@ -185,7 +187,7 @@ var fs = require('fs');
 var path = require('path');
 
 var PLUGIN_SHORT_NAME = 'remoraTerminalBridge';
-var PLUGIN_VERSION = '0.9.0';
+var PLUGIN_VERSION = '0.11.0';
 var ALLOWED_SHELLS = ['cmd', 'powershell', 'bash', 'zsh'];
 // 'operator' (RC-14.27) is a Windows admin shell (protocol 1/6) that the agent
 // re-launches under the calling operator's AD identity via S4U2Self. Server-side
@@ -266,6 +268,8 @@ var riReachTimes = Object.create(null);
 // In-memory only — restarting Mesh clears all grants, which is the
 // safer default for a security gate.
 var totpGrantCache = Object.create(null);
+// Per-process, per-account budget; includes successful Admin opens. No password cache.
+var adminPasswordAttempts = Object.create(null);
 var TOTP_GRANT_TTL_MS = 15 * 60 * 1000;
 
 function totpGrantKey(actor, nodeId) { return String(actor) + '|' + String(nodeId); }
@@ -352,13 +356,11 @@ module.exports.remoraTerminalBridge = function (parent) {
 
     function verifyTotp(user, token) {
         if (!user || !user.otpsecret) return false;
-        if (typeof token !== 'string' || token.length !== 6) return false;
+        if (typeof token !== 'string' || !/^\d{6}$/.test(token)) return false;
         try {
-            var otplib = require('otplib');
-            otplib.authenticator.options = { window: 2 }; // ±1 min, same as Mesh login
-            return otplib.authenticator.check(token, user.otpsecret) === true;
+            var otplib = require(require.resolve('otplib', { paths: [path.dirname(obj.meshServer.webPublicPath)] }));
+            return otplib.verifySync({ secret: user.otpsecret, token: token, epochTolerance: 60 }).valid === true;
         } catch (e) {
-            console.log('[remoraTerminalBridge] otplib unavailable:', e.message);
             return false;
         }
     }
@@ -827,6 +829,7 @@ module.exports.remoraTerminalBridge = function (parent) {
 
     function handleRiRun(command, dbGet, session) {
         var user = dbGet && dbGet.user;
+        if (!user || typeof user._id !== 'string' || !user._id) return replyError(session, command, 'auth_required');
         hasRemoteInstallPermission(user, function (allowed) {
             var actor = user && user._id;
             if (!allowed) {
@@ -836,7 +839,6 @@ module.exports.remoraTerminalBridge = function (parent) {
             var host = String(command.host || '');
             var groupId = String(command.groupId || '');
             var installFlags = (typeof command.installFlags === 'number') ? command.installFlags : 0;
-            var totpToken = command.totpToken;
             if (!RI_HOST_RE.test(host)) return replyError(session, command, 'invalid_host');
             if (!RI_GROUP_RE.test(groupId)) return replyError(session, command, 'invalid_group');
 
@@ -848,14 +850,6 @@ module.exports.remoraTerminalBridge = function (parent) {
                 return replyError(session, command, 'permission_denied');
             }
 
-            // TOTP step-up (fresh token or a still-valid grant for this actor+host).
-            if (!hasValidTotpGrant(actor, host)) {
-                if (!verifyTotp(user, totpToken)) {
-                    dispatchRiAudit(actor, { msg: 'Remote Install push denied (TOTP)', actor: actor, host: host, group: groupId, status: 'denied' });
-                    return replyError(session, command, '2fa-failed');
-                }
-                markTotpGrant(actor, host);
-            }
             if (!riRateLimitOk(actor)) {
                 dispatchRiAudit(actor, { msg: 'Remote Install push rate-limited', actor: actor, host: host, status: 'denied' });
                 return replyError(session, command, 'rate_limited');
@@ -978,14 +972,15 @@ module.exports.remoraTerminalBridge = function (parent) {
         if (action === 'remoteInstall.testAccount') return handleRiTestAccount(command, dbGet, session);
         if (action === 'remoteInstall.reachability') return handleRiReachability(command, dbGet, session);
         if (action === 'remoteInstall.run') return handleRiRun(command, dbGet, session);
-        if (action !== 'open') return replyError(session, command, 'unknown_pluginaction');
+        var isAdminOpen = action === 'openAdmin';
+        if (action !== 'open' && !isAdminOpen) return replyError(session, command, 'unknown_pluginaction');
 
         var nodeId = (command.nodeId != null) ? String(command.nodeId) : '';
         var shell = String(command.shell || '');
         var context = String(command.context || 'user');
         var totpToken = command.totpToken;
 
-        if (!nodeId || nodeId.indexOf('node//') !== 0) {
+        if (!nodeId || (isAdminOpen ? (nodeId.length > 128 || !/^node\/[^/]*\/[A-Za-z0-9@$_.-]+$/.test(nodeId)) : nodeId.indexOf('node//') !== 0)) {
             return replyError(session, command, 'invalid_nodeId');
         }
         if (ALLOWED_SHELLS.indexOf(shell) === -1) {
@@ -994,6 +989,8 @@ module.exports.remoraTerminalBridge = function (parent) {
         if (ALLOWED_CONTEXTS.indexOf(context) === -1) {
             return replyError(session, command, 'invalid_context');
         }
+        if (isAdminOpen && context !== 'operator') return replyError(session, command, 'invalid_context');
+        if (isAdminOpen && shell !== 'cmd' && shell !== 'powershell') return replyError(session, command, 'unsupported_shell_context');
 
         var protocol = PROTOCOL_MAP[shell + '|' + context];
         if (typeof protocol !== 'number') {
@@ -1005,6 +1002,79 @@ module.exports.remoraTerminalBridge = function (parent) {
         var actor = user ? user._id : null;
         if (!actor) {
             return replyError(session, command, 'auth_required');
+        }
+        if (isAdminOpen) {
+            // Password verification authorizes only THIS API invocation. Native relay
+            // remains a separate path; no claim of native/agent enforcement is made.
+            var password = command.password;
+            delete command.password;
+            var web = obj.meshServer && obj.meshServer.webserver;
+            var domainId = user.domain || '';
+            var domain = obj.meshServer && obj.meshServer.config && obj.meshServer.config.domains && obj.meshServer.config.domains[domainId];
+            if (nodeId.split('/')[1] !== domainId) return replyError(session, command, 'invalid_nodeId');
+            if (typeof password !== 'string' || !password || password.length > 1024) return replyError(session, command, 'password_required');
+            if (!web || typeof web.authenticate !== 'function' || !domain || (domain.auth && domain.auth !== 'default' && domain.auth !== 'ldap')) return replyError(session, command, 'password_unavailable');
+
+            checkAdminRights(function (allowed) {
+                if (!allowed) return denyAdmin('permission_denied');
+                var now = Date.now();
+                var attempts = (adminPasswordAttempts[actor] || []).filter(function (at) { return now - at < 60000; });
+                adminPasswordAttempts[actor] = attempts;
+                if (attempts.length >= 5) return denyAdmin('rate_limited');
+                attempts.push(now);
+                // Local accounts use their native login key. LDAP follows the existing
+                // Core email-local-part convention; mismatches fail closed by returned id.
+                var username = user._id.split('/')[2];
+                if (domain.auth === 'ldap' && typeof user.email === 'string' && user.email.indexOf('@') > 0) username = user.email.split('@')[0];
+                try {
+                    web.authenticate(username, password, domain, function (err, returnedId) {
+                        if (err || returnedId !== actor) return denyAdmin('password_failed');
+                        // Authentication can be asynchronous; re-read rights and account
+                        // state before issuing a cookie. No reusable password/TOTP grant.
+                        checkAdminRights(function (stillAllowed) {
+                            if (!stillAllowed) return denyAdmin('permission_denied');
+                            user = web.users[actor];
+                            proceedOpen();
+                        });
+                    });
+                } catch (e) { denyAdmin('password_unavailable'); }
+                finally { password = null; }
+            });
+            return;
+        }
+
+        function denyAdmin(error) {
+            password = null;
+            dispatchAudit(actor, { msg: 'Admin terminal open denied', nodeid: nodeId, shell: shell, context: context, actor: actor, status: 'denied', reason: error });
+            replyError(session, command, error);
+        }
+
+        function currentAdminUser() {
+            var current = web.users && web.users[actor];
+            if (!session.user || session.user._id !== actor || !current || (!isSuperAdmin(current) && (current.siteadmin & SITERIGHT_LOCKED))) return null;
+            var role = deriveRemoraRole(current);
+            if (role !== 'super_admin' && role !== 'administrator' && role !== 'operator') return null;
+            // Auditor is an explicit override over operator marker membership.
+            var auditor = obj.meshServer.pluginHandler && obj.meshServer.pluginHandler.plugins && obj.meshServer.pluginHandler.plugins.remoraAuditor;
+            if (role === 'operator' && auditor) {
+                var auditorIds = null;
+                try { auditor.serveraction({ pluginaction: 'list' }, { user: current, send: function (body) { if (Array.isArray(body.auditorUserIds)) auditorIds = body.auditorUserIds; } }); }
+                catch (e) { return null; }
+                if (!auditorIds || auditorIds.indexOf(actor) >= 0) return null;
+            }
+            return current;
+        }
+
+        function checkAdminRights(done) {
+            var current = currentAdminUser();
+            if (!current) return done(false);
+            if (typeof web.GetNodeWithRights !== 'function') return done(false);
+            try {
+                web.GetNodeWithRights(domain, current, nodeId, function (node, rights, visible) {
+                    done(!!currentAdminUser() && !!node && node._id === nodeId && visible === true && typeof rights === 'number' && (rights & 8) !== 0
+                        && (rights === 0xFFFFFFFF || (rights & (512 | 256)) === 0));
+                });
+            } catch (e) { done(false); }
         }
 
         // RC-15.A.1 — server-enforce the SYSTEM terminal BEFORE issuing the
@@ -1042,7 +1112,7 @@ module.exports.remoraTerminalBridge = function (parent) {
         // (RC-13.19.1 fix; before v0.2.0 every reconnect failed with
         // 2fa-failed because the client cached the grant but the server
         // demanded a fresh code each time).
-        if (context === 'system' || context === 'operator') {
+        if (!isAdminOpen && (context === 'system' || context === 'operator')) {
             var grantOk = hasValidTotpGrant(actor, nodeId);
             if (!grantOk) {
                 if (!verifyTotp(user, totpToken)) {
@@ -1118,7 +1188,8 @@ module.exports.remoraTerminalBridge = function (parent) {
             protocol: protocol,
             actor: actor,
             sessionId: sessionId,
-            status: 'success'
+            status: 'success',
+            authorization: isAdminOpen ? 'account-password' : 'existing-terminal-policy'
         });
 
         reply(session, command, {
