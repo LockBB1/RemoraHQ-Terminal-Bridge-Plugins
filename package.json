@@ -1,11 +1,11 @@
 {
   "name": "remorahq-terminal-bridge-plugins",
-  "version": "0.13.1",
+  "version": "0.14.0",
   "description": "RemoraHQ Terminal Bridge MeshCentral plugin",
   "main": "remoraTerminalBridge.js",
   "scripts": {
     "test": "node --test test/remote-install.cjs test/terminal-admin.cjs test/linux-vault.cjs",
-    "test:kerberos": "ruby test/bundle-startup.rb && ruby test/gssapi-safety.rb && ruby test/kerberos-once.rb"
+    "test:kerberos": "ruby test/bundle-startup.rb && ruby test/diagnostic-transport.rb && ruby test/gssapi-safety.rb && ruby test/kerberos-once.rb"
   },
   "license": "Apache-2.0",
   "repository": {

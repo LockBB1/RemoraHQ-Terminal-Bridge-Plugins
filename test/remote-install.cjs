@@ -29,7 +29,7 @@ function fixture(options = {}) {
         mkdirSync() {}, createWriteStream() { return new EventEmitter(); },
         mkdtempSync(prefix) { return prefix + 'fixture'; }, chmodSync() {},
         rmSync(file) { scratchRemoved.push(file); },
-        unlinkSync(file) { removed.push(file); files.delete(file); },
+        unlinkSync(file) { if (options.unlinkFailure && file.endsWith('.exe')) throw new Error('fixture cleanup failure'); removed.push(file); files.delete(file); },
         renameSync(from, to) { files.set(to, files.get(from)); files.delete(from); },
     };
     const fakeRequire = name => {
@@ -49,7 +49,7 @@ function fixture(options = {}) {
             child.pid = 12345;
             child.stdin = { on() {}, write(body) { spawns.at(-1).stdin = JSON.parse(body); }, end(body) { if (body) spawns.at(-1).stdin = JSON.parse(body); } };
             child.kill = () => {};
-            if (!options.hold) queueMicrotask(() => { child.stdout.emit('data', Buffer.from('ri-result:' + (options.outcome || (options.installError ? 'install_failed' : 'installer_completed')))); child.emit('close', 0); });
+            if (!options.hold) queueMicrotask(() => { child.stdout.emit('data', Buffer.from(options.diagnosticMarker || ('ri-result:' + (options.outcome || (options.installError ? 'install_failed' : 'installer_completed'))))); child.emit('close', 0); });
             child.release = outcome => { child.stdout.emit('data', Buffer.from('ri-result:' + outcome)); child.emit('close', 0); };
             spawns.at(-1).child = child;
             return child;
@@ -91,6 +91,40 @@ function fixture(options = {}) {
     }
     return { request, audits, spawns, installers, removed, files, scratchRemoved, killed, secret, reads: () => reads };
 }
+
+test('diagnostic requires permission and returns only bounded verification results', async () => {
+    const options = { linux: true, metadata: { blob: 'Zml4dHVyZQ==', username: 'fixture@EXAMPLE.INVALID' }, diagnosticMarker: 'ri-diagnostic:mismatch:unknown_error:present:confirmed' };
+    const denied = fixture({ ...options, flags: { canRemoteInstall: false } });
+    assert.equal((await denied.request({ pluginaction: 'remoteInstall.diagnostic' })).error, 'permission_denied');
+    assert.equal(denied.installers.length, 0);
+    const deniedGroup = fixture({ ...options, rights: 0 });
+    assert.equal((await deniedGroup.request({ pluginaction: 'remoteInstall.diagnostic' })).error, 'permission_denied');
+    assert.equal(deniedGroup.installers.length, 0);
+    const f = fixture(options);
+    const result = await f.request({ pluginaction: 'remoteInstall.diagnostic' });
+    assert.equal(result.result, 'ok');
+    assert.deepEqual([result.hash, result.signature, result.signer, result.cleanup], ['mismatch', 'unknown_error', 'present', 'confirmed']);
+    assert.equal(f.spawns.length, 1);
+    assert.equal(f.spawns[0].stdin.mode, 'diagnostic');
+    assert.equal(JSON.stringify(result).includes('fixture@'), false);
+    assert.equal(f.audits.at(-1).status, 'success');
+    const failedCleanup = fixture({ ...options, unlinkFailure: true });
+    assert.equal((await failedCleanup.request({ pluginaction: 'remoteInstall.diagnostic' })).error, 'diagnostic_inconclusive');
+    assert.equal(failedCleanup.audits.at(-1).status, 'unknown');
+    const malformed = fixture({ ...options, diagnosticMarker: 'ri-diagnostic:match:valid:present:confirmed PRIVATE' });
+    assert.equal((await malformed.request({ pluginaction: 'remoteInstall.diagnostic' })).error, 'diagnostic_inconclusive');
+    const windows = fixture({ diagnosticMarker: 'ri-diagnostic:match:valid:present:confirmed' });
+    assert.equal((await windows.request({ pluginaction: 'remoteInstall.diagnostic' })).result, 'ok');
+    assert.equal(windows.spawns.length, 1);
+});
+
+test('diagnostic rate limit refuses generation before launching another job', async () => {
+    const f = fixture({ linux: true, metadata: { blob: 'Zml4dHVyZQ==', username: 'fixture@EXAMPLE.INVALID' }, diagnosticMarker: 'ri-diagnostic:match:valid:present:confirmed' });
+    for (let i = 0; i < 30; i++) assert.equal((await f.request({ pluginaction: 'remoteInstall.diagnostic' })).result, 'ok');
+    assert.equal((await f.request({ pluginaction: 'remoteInstall.diagnostic' })).error, 'rate_limited');
+    assert.equal(f.installers.length, 30);
+    assert.equal(f.spawns.length, 30);
+});
 
 test('an authorized operator without TOTP can install, with audit and cleanup', async () => {
     const f = fixture(); const result = await f.request({ installFlags: 2 });

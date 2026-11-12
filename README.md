@@ -14,7 +14,7 @@ family.
 | Source repo folder | `RemoraHQ-Terminal-Bridge-Plugins` |
 | Deploy folder under Mesh | `meshcentral/plugins/remoraTerminalBridge` |
 
-## Terminal contract (Bridge 0.13.1)
+## Terminal contract (Bridge 0.14.0)
 
 The `open` action accepts `nodeId`, `shell` (`cmd`, `powershell`, `bash`,
 `zsh`) and the optional `context: "user"`. It returns a session identifier,
@@ -34,7 +34,7 @@ agent behavior are separate and unchanged; this does not close that route.
 Deployments need matching plugin and SPA versions. The `.setup` snapshot is not
 updated by edits to this checkout.
 
-## Remote Install 0.13.1
+## Remote Install 0.14.0
 
 Цели — Windows x64 с Windows PowerShell 5.1 и WinRM. Сервер — Windows
 (сохранённый DPAPI LocalMachine/Negotiate путь) либо Debian (Ruby WinRM,
@@ -43,6 +43,11 @@ Kerberos/GSSAPI). Debian требует полный DNS hostname, SPN `HTTP/hos
 учётные записи для Debian не поддерживаются. LDAP-вход в MeshCentral сам по
 себе не подтверждает Kerberos/WinRM. WinRM HTTP/5985 использует шифрование
 сообщений GSSAPI, пароль в WinRM-клиент не передаётся.
+
+Отдельная диагностика передаёт новый установщик выбранной группы и сообщает
+результаты проверки его SHA-256 и Authenticode, наличие signer и подтверждение
+очистки. Она не запускает установку или удаление и не проверяет ранее переданный
+файл. Потеря связи или неподтверждённая очистка означает неизвестный результат.
 
 Для **каждого** Install/Reinstall/Remove сервер проверяет authenticated user,
 `canRemoteInstall` и `MESHRIGHT_EDITMESH` на выбранную существующую Machine
@@ -183,8 +188,11 @@ Windows DPAPI blob на Debian не мигрирует: сохраните accou
 `npm test` исполняет dispatcher/credential guards/cleanup на синтетических
 filesystem/process/DB fixtures, включая Linux timeout. `npm run test:kerberos`
 требует Ruby и installed pinned WinRM; проверяет запуск helper с конфликтующей
-версией logger в изолированном bundle, Ruby dispatch GSSAPI guard
+версией logger в изолированном bundle, обработку диагностики и cleanup,
+Ruby dispatch GSSAPI guard
 с синтетической FFI и реальные методы pinned gem на 401/WSMan fault без HTTP.
+`powershell.exe -NoProfile -NonInteractive -File test/diagnostic.ps1` проверяет
+независимую классификацию SHA-256 и подписи с синтетическими результатами.
 `powershell.exe -NoProfile -NonInteractive -File test/lifecycle.ps1` выполняет
 копию target script в temporary directory: identity/ACL/signatures/services и
 process запуск мокируются, реальные службы/установщики не затрагиваются.

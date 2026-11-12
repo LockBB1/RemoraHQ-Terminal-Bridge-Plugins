@@ -187,7 +187,7 @@ var fs = require('fs');
 var path = require('path');
 
 var PLUGIN_SHORT_NAME = 'remoraTerminalBridge';
-var PLUGIN_VERSION = '0.13.1';
+var PLUGIN_VERSION = '0.14.0';
 var ALLOWED_SHELLS = ['cmd', 'powershell', 'bash', 'zsh'];
 // Only native User terminal contexts are issued by this plugin.
 var REMORA_PERMISSIONS_DOC_ID = 'remoraPermissions';
@@ -572,7 +572,9 @@ module.exports.remoraTerminalBridge = function (parent) {
             child.on('error', function () { finish(new Error('transport_unavailable')); });
             child.on('close', function (code) { finish(null, { code: code, stdout: out }); });
             child.stdin.on('error', function () { /* close/error reports the result */ });
-            child.stdin.end(JSON.stringify({ username: meta.username, password: password.toString('utf8'), host: host, mode: mode, localExe: localExe, operationId: operationId, installerSha256: installerSha256, cacheDirectory: scratch, script: mode === 'probe' ? null : fs.readFileSync(path.join(__dirname, 'remote-install', 'lifecycle.ps1'), 'utf8') }));
+            var job = { username: meta.username, password: password.toString('utf8'), host: host, mode: mode, localExe: localExe, operationId: operationId, installerSha256: installerSha256, cacheDirectory: scratch, script: mode === 'probe' ? null : fs.readFileSync(path.join(__dirname, 'remote-install', mode === 'diagnostic' ? 'diagnostic.ps1' : 'lifecycle.ps1'), 'utf8') };
+            if (mode === 'diagnostic') job.directoryScript = fs.readFileSync(path.join(__dirname, 'remote-install', 'diagnostic-directory.ps1'), 'utf8');
+            child.stdin.end(JSON.stringify(job));
         } catch (_) { kill(); finish(new Error('transport_unavailable')); }
     }
 
@@ -753,6 +755,35 @@ module.exports.remoraTerminalBridge = function (parent) {
         ].join("\n");
     }
 
+    function riDiagnosticScript() {
+        return [
+            "$ErrorActionPreference='Stop'",
+            "$result='ri-diagnostic:error:error:unknown'; $cleanup='unknown'; $s=$null; $job=$null; $createdOk=$false",
+            "try {",
+            "  $job=[Console]::In.ReadLine() | ConvertFrom-Json",
+            "  Add-Type -AssemblyName System.Security",
+            "  $enc=[Convert]::FromBase64String($job.blob); $e=[Text.Encoding]::UTF8.GetBytes('" + REMORA_RI_ENTROPY + "')",
+            "  $dec=[Security.Cryptography.ProtectedData]::Unprotect($enc,$e,[Security.Cryptography.DataProtectionScope]::LocalMachine)",
+            "  $pw=[Text.Encoding]::UTF8.GetString($dec); $sec=ConvertTo-SecureString $pw -AsPlainText -Force; $pw=$null",
+            "  $cred=New-Object System.Management.Automation.PSCredential($job.username,$sec)",
+            "  $s=New-PSSession -ComputerName $job.host -Authentication Negotiate -Credential $cred -ErrorAction Stop",
+            "  try {",
+            "    $directory=[scriptblock]::Create($job.directoryScript)",
+            "    $created=Invoke-Command -Session $s -ScriptBlock $directory -ArgumentList 'create',$job.operationId",
+            "    $rt=([string]$created).Replace('ri-directory:','')",
+            "    if ($rt -notmatch ('^[A-Za-z]:\\\\[^''\\r\\n]+\\\\RemoraHQ-Diagnostic-' + $job.operationId + '\\\\installer\\.exe$')) { throw 'directory' }",
+            "    $createdOk=$true",
+            "    Copy-Item -ToSession $s -LiteralPath $job.localExe -Destination $rt -Force",
+            "    $result=Invoke-Command -Session $s -ScriptBlock ([scriptblock]::Create($job.script)) -ArgumentList $rt,$job.installerSha256",
+            "  } finally {",
+            "    try { if ($createdOk) { $removed=Invoke-Command -Session $s -ScriptBlock ([scriptblock]::Create($job.directoryScript)) -ArgumentList 'remove',$job.operationId; if ($removed -eq 'ri-directory:removed') { $cleanup='confirmed' } } } catch {}",
+            "    Remove-PSSession $s -ErrorAction Stop",
+            "  }",
+            "} catch { $result='ri-diagnostic:error:error:unknown' }",
+            "Write-Output (([string]$result) + ':' + $cleanup)"
+        ].join("\n");
+    }
+
     function handleRiReachability(command, dbGet, session) {
         var user = dbGet && dbGet.user;
         if (!user || !user._id) return replyError(session, command, 'auth_required');
@@ -798,6 +829,48 @@ module.exports.remoraTerminalBridge = function (parent) {
             }
             if (process.platform === 'linux') return riLinuxRun(meta, host, 'probe', null, null, complete);
             runPowerShell(riReachabilityScript(meta.blob, meta.username, host), null, complete);
+        });
+    }
+
+    var riDiagnosticActive = 0;
+    function handleRiDiagnostic(command, dbGet, session) {
+        var user = dbGet && dbGet.user;
+        if (!user || typeof user._id !== 'string' || !user._id) return replyError(session, command, 'auth_required');
+        hasRemoteInstallPermission(user, function (allowed) {
+            if (!allowed) { dispatchRiAudit(user._id, { msg: 'Remote Install diagnostic denied', actor: user._id, status: 'denied' }); return replyError(session, command, 'permission_denied'); }
+            var host = String(command.host || ''), groupId = String(command.groupId || '');
+            if (!RI_HOST_RE.test(host)) return replyError(session, command, 'invalid_host');
+            if (!RI_GROUP_RE.test(groupId)) return replyError(session, command, 'invalid_group');
+            if (!hasGroupInstallRight(user, groupId)) { dispatchRiAudit(user._id, { msg: 'Remote Install diagnostic denied', actor: user._id, status: 'denied' }); return replyError(session, command, 'permission_denied'); }
+            if (!riRateLimitOk(user._id, riReachTimes, RI_REACH_MAX)) { dispatchRiAudit(user._id, { msg: 'Remote Install diagnostic rate-limited', actor: user._id, status: 'denied' }); return replyError(session, command, 'rate_limited'); }
+            if (riDiagnosticActive >= 4) return replyError(session, command, 'too_many_operations');
+            var meta = riReadCredMeta();
+            if (!meta || !meta.blob || !RI_BLOB_RE.test(meta.blob) || !RI_USERNAME_RE.test(meta.username || '')) return replyError(session, command, 'not_configured');
+            if (process.platform !== 'win32' && process.platform !== 'linux') return replyError(session, command, 'unsupported_platform');
+            if (process.platform === 'linux' && (!host.includes('.') || /^[\d.]+$/.test(host))) return replyError(session, command, 'kerberos_fqdn_required');
+            riDiagnosticActive++;
+            dispatchRiAudit(user._id, { msg: 'Remote Install diagnostic started', actor: user._id, status: 'started' });
+            var operationId = crypto.randomBytes(16).toString('hex');
+            riGenerateInstaller(groupId, 0, function (err, localExe) {
+                if (err || !localExe) { riDiagnosticActive--; dispatchRiAudit(user._id, { msg: 'Remote Install diagnostic unknown', actor: user._id, status: 'unknown' }); return replyError(session, command, 'diagnostic_inconclusive'); }
+                var sha, script, directoryScript;
+                try {
+                    sha = crypto.createHash('sha256').update(fs.readFileSync(localExe)).digest('hex');
+                    script = fs.readFileSync(path.join(__dirname, 'remote-install', 'diagnostic.ps1'), 'utf8');
+                    directoryScript = fs.readFileSync(path.join(__dirname, 'remote-install', 'diagnostic-directory.ps1'), 'utf8');
+                } catch (_) { try { fs.unlinkSync(localExe); } catch (_) {} riDiagnosticActive--; dispatchRiAudit(user._id, { msg: 'Remote Install diagnostic unknown', actor: user._id, status: 'unknown' }); return replyError(session, command, 'diagnostic_inconclusive'); }
+                function complete(runErr, res) {
+                    var serverClean = true;
+                    try { fs.unlinkSync(localExe); } catch (e) { if (e.code !== 'ENOENT') serverClean = false; }
+                    riDiagnosticActive--;
+                    var match = !runErr && res && res.code === 0 && /^ri-diagnostic:(match|mismatch|error):(valid|not_signed|not_trusted|hash_mismatch|unknown_error|other|error):(present|absent|unknown):(confirmed|unknown)\s*$/.exec((res.stdout || '').trim());
+                    if (!match || !serverClean) { dispatchRiAudit(user._id, { msg: 'Remote Install diagnostic unknown', actor: user._id, status: 'unknown' }); return replyError(session, command, 'diagnostic_inconclusive'); }
+                    dispatchRiAudit(user._id, { msg: 'Remote Install diagnostic completed', actor: user._id, status: match[4] === 'confirmed' ? 'success' : 'unknown' });
+                    reply(session, command, { hash: match[1], signature: match[2], signer: match[3], cleanup: match[4] });
+                }
+                if (process.platform === 'linux') return riLinuxRun(meta, host, 'diagnostic', localExe, operationId, complete, sha);
+                runPowerShell(riDiagnosticScript(), JSON.stringify({ blob: meta.blob, username: meta.username, host: host, localExe: localExe, operationId: operationId, installerSha256: sha, script: script, directoryScript: directoryScript }), complete, 180000);
+            });
         });
     }
 
@@ -1022,6 +1095,7 @@ module.exports.remoraTerminalBridge = function (parent) {
         if (action === 'remoteInstall.setAccount') return handleRiSetAccount(command, dbGet, session);
         if (action === 'remoteInstall.testAccount') return handleRiTestAccount(command, dbGet, session);
         if (action === 'remoteInstall.reachability') return handleRiReachability(command, dbGet, session);
+        if (action === 'remoteInstall.diagnostic') return handleRiDiagnostic(command, dbGet, session);
         if (action === 'remoteInstall.run') return handleRiRun(command, dbGet, session);
         if (action === 'remoteInstall.status') return handleRiOperationStatus(command, dbGet, session);
         if (action === 'openAdmin') { delete command.password; return replyError(session, command, 'terminal_admin_unavailable'); }

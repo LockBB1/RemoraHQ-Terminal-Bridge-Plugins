@@ -38,6 +38,36 @@ begin
         result = shell.run("$ErrorActionPreference='Stop'; if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'admin_required' }; 'winrm-ok'")
         raise 'probe failed' unless result.exitcode == 0 && result.stdout.lines.any? { |line| line.strip == 'winrm-ok' }
         puts 'ping=Unknown;winrm=True'
+      elsif job['mode'] == 'diagnostic'
+        id = job.fetch('operationId')
+        raise 'invalid job' unless id.match?(/\A[a-f0-9]{32}\z/) && job.fetch('installerSha256').match?(/\A[a-f0-9]{64}\z/)
+        directory_script = [job.fetch('directoryScript')].pack('m0')
+        directory_command = ->(action) { "$s=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('#{directory_script}')); & ([scriptblock]::Create($s)) -Action '#{action}' -OperationId '#{id}'" }
+        diagnostic_marker = 'ri-diagnostic:error:error:unknown'
+        cleanup = 'unknown'
+        directory_created = false
+        begin
+          created = shell.run(directory_command.call('create'))
+          path = created.stdout.lines.map(&:strip).grep(/\Ari-directory:/).last.to_s.delete_prefix('ri-directory:')
+          raise 'directory unavailable' unless created.exitcode == 0 && path.match?(/\A[A-Za-z]:\\[^\r\n']+\\RemoraHQ-Diagnostic-#{id}\\installer\.exe\z/)
+          directory_created = true
+          WinRM::FS::FileManager.new(connection).upload(job.fetch('localExe'), path)
+          encoded = [job.fetch('script')].pack('m0')
+          cmd = "$s=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('#{encoded}')); & ([scriptblock]::Create($s)) -Installer '#{path}' -InstallerSha256 '#{job.fetch('installerSha256')}'"
+          checked = shell.run(cmd)
+          marker = checked.stdout.lines.map(&:strip).grep(/\Ari-diagnostic:(?:match|mismatch|error):(?:valid|not_signed|not_trusted|hash_mismatch|unknown_error|other|error):(?:present|absent|unknown)\z/).last
+          diagnostic_marker = marker if checked.exitcode == 0 && marker
+        ensure
+          begin
+            if directory_created
+              removed = shell.run(directory_command.call('remove'))
+              cleanup = 'confirmed' if removed.exitcode == 0 && removed.stdout.lines.map(&:strip).include?('ri-directory:removed')
+            end
+          rescue StandardError
+            cleanup = 'unknown'
+          end
+          puts(diagnostic_marker + ':' + cleanup)
+        end
       else
         remote = nil
         begin
