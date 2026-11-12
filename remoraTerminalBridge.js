@@ -187,7 +187,7 @@ var fs = require('fs');
 var path = require('path');
 
 var PLUGIN_SHORT_NAME = 'remoraTerminalBridge';
-var PLUGIN_VERSION = '0.13.0';
+var PLUGIN_VERSION = '0.13.1';
 var ALLOWED_SHELLS = ['cmd', 'powershell', 'bash', 'zsh'];
 // Only native User terminal contexts are issued by this plugin.
 var REMORA_PERMISSIONS_DOC_ID = 'remoraPermissions';

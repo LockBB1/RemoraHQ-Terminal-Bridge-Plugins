@@ -1,12 +1,12 @@
 # frozen_string_literal: true
 # One bounded, non-interactive job. Secrets arrive only through stdin.
+ENV['BUNDLE_GEMFILE'] ||= '/opt/remorahq-winrm/Gemfile'
+ENV['BUNDLE_PATH'] ||= '/opt/remorahq-winrm/vendor/bundle'
+require 'bundler/setup'
 require 'json'
 require 'logger'
 require 'open3'
 require 'fileutils'
-ENV['BUNDLE_GEMFILE'] ||= '/opt/remorahq-winrm/Gemfile'
-ENV['BUNDLE_PATH'] ||= '/opt/remorahq-winrm/vendor/bundle'
-require 'bundler/setup'
 require 'winrm'
 require 'winrm-fs'
 require 'winrm/shells/base'
