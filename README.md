@@ -14,7 +14,7 @@ family.
 | Source repo folder | `RemoraHQ-Terminal-Bridge-Plugins` |
 | Deploy folder under Mesh | `meshcentral/plugins/remoraTerminalBridge` |
 
-## Terminal contract (Bridge 0.12.0)
+## Terminal contract (Bridge 0.13.0)
 
 The `open` action accepts `nodeId`, `shell` (`cmd`, `powershell`, `bash`,
 `zsh`) and the optional `context: "user"`. It returns a session identifier,
@@ -34,32 +34,173 @@ agent behavior are separate and unchanged; this does not close that route.
 Deployments need matching plugin and SPA versions. The `.setup` snapshot is not
 updated by edits to this checkout.
 
-## Remote Install
+## Remote Install 0.13.0
 
-Since native plugin version `0.10.0` (retained in `0.12.0`), `remoteInstall.run` accepts `host`,
-`groupId` and optional `installFlags`, without a TOTP field or grant. The
-authenticated caller still needs `canRemoteInstall` and install rights on the
-target Machine Group. Host/group validation, the per-actor push limit,
-fail-closed duplicate detection, sealed local push credentials and audit remain.
-Push Account administration remains separately authorized.
+Цели — Windows x64 с Windows PowerShell 5.1 и WinRM. Сервер — Windows
+(сохранённый DPAPI LocalMachine/Negotiate путь) либо Debian (Ruby WinRM,
+Kerberos/GSSAPI). Debian требует полный DNS hostname, SPN `HTTP/hostname`,
+доступ к KDC/DNS и учётную запись `user@REALM`; IP, NTLM fallback и локальные
+учётные записи для Debian не поддерживаются. LDAP-вход в MeshCentral сам по
+себе не подтверждает Kerberos/WinRM. WinRM HTTP/5985 использует шифрование
+сообщений GSSAPI, пароль в WinRM-клиент не передаётся.
 
-Deploy this plugin and the matching SPA together. An earlier plugin can reject
-the new SPA with `2fa-failed`; an earlier SPA still asks for TOTP even though
-this run handler no longer validates it. Mixed versions do not provide the new
-policy consistently. The setup package snapshot and actual loaded server plugin
-must be checked separately; editing this checkout does not update either.
+Для **каждого** Install/Reinstall/Remove сервер проверяет authenticated user,
+`canRemoteInstall` и `MESHRIGHT_EDITMESH` на выбранную существующую Machine
+Group типа 2. По решению владельца эта привилегия позволяет указать любой
+доступный push account Windows-ПК, включая агент старого сервера; выбранная
+группа не является доказательством принадлежности ПК. Выдавайте её только
+операторам, которым разрешён такой охват. Push Account остаётся super-admin-only.
+Действия не требуют TOTP и не удаляют записи ни с текущего, ни со старого сервера.
 
-The current SPA plugin RPC timeout is 15 seconds; this backend allows the push
-process up to 180 seconds, plus preparation. A SPA timeout does not determine
-whether the installation succeeded or failed, and this mismatch is not fixed
-by `0.12.0`. Do not automatically retry an installation with an unknown outcome.
-The pinned setup snapshot remains Bridge `0.9.0`; it does not provide this newer
-Remote Install authentication contract or the current terminal input rejections.
+| `remoteInstall.run.mode` | Поведение |
+| --- | --- |
+| `install` (также default для прежнего API) | Проверка дубликата по DB fail-closed и независимая проверка служб на самом ПК; найденный агент блокирует установку. |
+| `reinstall` | Ровно одна проверенная установка: `-fulluninstall` с явным `--meshServiceName`, подтверждение удаления службы и её Diagnostic-службы, затем новый installer выбранной группы. |
+| `remove` | То же проверенное удаление без последующего запуска installer. Копия нового installer используется только как эталон подписи. |
 
-`npm test` exercises the real dispatcher with in-memory filesystem, database,
-installer and process fixtures. It never runs PowerShell or WinRM and does not
-prove DPAPI decryption, a live agent install or deployment readiness. The npm
-package metadata version is independent of the native `config.json` version.
+`-uninstall` и `-fulluninstall` не взаимозаменяемы: первый удаляет службу,
+второй также очищает установленный агент. Используется второй; его exit 0
+не заменяет проверку отсутствия служб. Реальный эффект зависит от сборки
+MeshAgent и должен быть принят на тестовом ПК. При timeout/ошибке удаления
+новая установка не запускается.
+
+Переданный installer сверяется на ПК с SHA-256 серверного файла, включая
+штатные unsigned сборки в Install. Удаление дополнительно допускает только
+локальный EXE без reparse points, распознанное штатное имя службы либо `.msh` с
+MeshID/ServerID и действительную Authenticode-подпись **тем же сертификатом**,
+что installer текущего сервера. Это сознательная узкая граница: ротация
+сертификата, неподписанный или повреждённый EXE, отсутствующий файл,
+неоднозначные службы требуют ручной диагностики. Никакой перебор удаления
+всех установок или исполнение произвольного registry uninstall command не
+выполняется. Штатной службе не требуется обязательный sidecar `.msh`:
+policy может быть embedded. После завершения uninstaller скрипт ждёт 12 s
+(известный upstream detached self-delete использует 10 s), затем до 20 s
+проверяет отсутствие старых EXE/MSH и служб. Сохранившиеся файлы блокируют
+fresh install; самостоятельно они не удаляются. Эти задержки и соответствие
+конкретному старому binary требуют server smoke. При отсутствии службы Reinstall/Remove возвращают
+`agent_not_found`; автоматического перехода к Install нет. Кастомные установки,
+которые невозможно распознать по службе или `.msh`, также требуют отдельной
+проверки перед использованием. Для Install не поддерживаются произвольные
+branding/serviceName настройки; устанавливается штатный агент текущего сервера.
+
+Run принимает `host`, `groupId`, необязательные `installFlags` (0–3), `mode`,
+`operationId` (32 lowercase hex). Для destructive mode требуется
+`confirmedHost`, точно равный `host`. SPA требует живой Check с
+`lifecycleVersion: 1` перед Reinstall/Remove: старый plugin мог бы проигнорировать
+неизвестный mode. Deploy matching SPA и Bridge вместе; старые setup snapshots
+сами не обновляются от изменения этого checkout.
+
+Один worker ограничен 180 s, подготовка installer — 30 s, новый SPA RPC run —
+240 s. Остальные RPC сохраняют обычный timeout. Результат `installer_completed`
+означает завершение installer, **не подтверждённое подключение агента**;
+проверьте группу отдельно. `removed` подтверждает отсутствие служб и старых EXE/MSH, без
+обещания удаления каждой оставшейся папки/registry entry. Ошибка соединения,
+timeout, потерянный маркер и сбой после начала destructive действия — неизвестный
+исход. Ни UI, ни helper не повторяют его автоматически. Локальный guard
+закреплённой WinRM запрещает повторную Kerberos инициализацию после 401 и
+повтор command при WSMan shell reset. Постоянный receipt intent на цели служит
+дополнительной защитой от повторного исполнения.
+
+`remoteInstall.status {host, groupId}` — read-only статус последнего intent:
+`running`, `completed`, `failed`, `unknown`, `outcome`, `mode`, `operationId`.
+После потери связи используйте Refresh outcome; неизвестный результат
+блокирует новый run. Локальные `remora-ri-operations/` записи/lock сохраняются
+в datapath до разрешения; после перезапуска незавершённый `running` читается
+как `unknown`. На ПК защищённый SYSTEM/Administrators каталог
+`%ProgramData%\RemoraHQ-RemoteInstall` содержит общий atomic lock и receipts.
+Это также блокирует конкурирующие aliases/серверы. Не очищайте active lock по
+таймеру. Для ручного восстановления сначала остановите новые push, подтвердите
+отсутствие выполняющегося installer/uninstaller и фактическое состояние ПК,
+сверьте аудит/operationId, затем адресно разрешите соответствующие server record
+и `.lock` и target `active`. Receipts оставляйте до окончания согласованного
+периода хранения intent; автоматической ротации/очистки здесь нет.
+
+Rate limits: 20 run/минуту на actor, не более четырёх active run на процесс,
+отдельный бюджет reachability/status;
+счётчики локальны процессу. Lock/receipt на цели остаётся последней границей
+конкуренции между серверами. Аудит содержит действие, actor, target/group,
+operationId и безопасный outcome, без raw WinRM/DPAPI/Kerberos ошибок.
+
+### Debian: локальный зашифрованный Push Account
+
+Пароль хранится в `datapath/remora-remoteinstall.json` (`0600`, владелец — UID
+процесса) как AES-256-GCM с новым 12-byte IV и authenticated username. Ключ —
+**32 сырых случайных байта**, отдельный файл вне datapath, Git, БД и образа.
+`REMORA_RI_KEY_FILE` содержит только абсолютный путь к нему. Код отказывает
+при неправильной длине, symlink, чужом владельце, доступе group/other к файлу
+или writable group/other родительском каталоге. Администратор хоста/Docker
+или захваченный процесс с доступом к ключу и ciphertext может извлечь пароль.
+Это локальное at-rest шифрование, не защита от администратора узла.
+
+Пример подготовки **на сервере владельцем**, вне репозитория (не выполняется
+plugin автоматически; UID должен соответствовать runtime, пример для root):
+
+```sh
+install -d -m 0700 /srv/remorahq-secrets
+umask 077
+openssl rand -out /srv/remorahq-secrets/push.key 32
+chmod 0400 /srv/remorahq-secrets/push.key
+```
+
+Выдайте файл только MeshCentral контейнеру read-only через Compose secret
+`/run/secrets/remora-ri-key` и задайте
+`REMORA_RI_KEY_FILE=/run/secrets/remora-ri-key`. Подмонтируйте проверенный
+`/etc/krb5.conf` read-only; DNS/realm/SPN и время настраивает администратор.
+Compose file-backed secrets могут сохранять host UID/mode: проверьте их внутри
+контейнера без вывода содержимого; `uid/mode` YAML сам по себе не доказывает права.
+Секреты не кладите в environment, command line, Compose YAML или image layer.
+Образ и pinned Ruby dependencies готовит root `docker/meshcentral/`; установите
+также полный каталог plugin, включая `remote-install/`, затем перезапустите
+MeshCentral. Суперадминистратор сохраняет учётную запись через Push Account,
+проверяет decrypt-only, затем WinRM на согласованном тестовом ПК. Пароль после
+сохранения обратно не возвращается.
+
+Для каждого job helper выполняет новый `kinit -l 10m -F -P`, пароль поступает
+через stdin, ccache живёт в отдельном `0700` каталоге. Билеты не разделяются
+между job и не требуют фонового renewal: следующий запуск получает новый TGT,
+в том числе после reboot. Parent очищает каталог при завершении/timeout и
+убивает process group, включая kinit. При аварийном завершении самого Node/хоста
+cleanup не гарантируется; используйте private/tmpfs `/tmp`, tickets не включайте
+в backups. Debug SOAP и сырые ошибки отключены, stdout допускает только markers.
+Pinned WinRM 2.4.1 проверяется helper; локальный guard дополнительно требует
+успешный статус GSSAPI и conf_state=1 для wrap/unwrap. Переход версии требует
+повторной проверки этого guard и реального Kerberos smoke.
+
+Для смены **пароля** обновите AD credential и сразу сохраните новое значение
+через super-admin UI, затем decrypt/bind test. Для смены **ключа** остановите
+новые push и дождитесь известного результата активных job, подготовьте новый
+отдельный key/secret mount, перезапустите runtime и заново сохраните пароль
+через UI. Автоматического decrypt/rekey старого файла нет. Старые backups
+оставляйте со старым ключом в отдельном защищённом хранилище. Для восстановления
+нужны соответствующие друг другу ciphertext + ключ, корректные UID/mode и
+krb5/DNS/time конфигурация; после восстановления повторите decrypt/bind test.
+Без ключа пароль не восстанавливается — super-admin вводит новую credential.
+Windows DPAPI blob на Debian не мигрирует: сохраните account заново; Windows
+путь продолжает использовать прежний LocalMachine blob/entropy.
+
+### Проверка и источники
+
+`npm test` исполняет dispatcher/credential guards/cleanup на синтетических
+filesystem/process/DB fixtures, включая Linux timeout. `npm run test:kerberos`
+требует Ruby и installed pinned WinRM; проверяет Ruby dispatch GSSAPI guard
+с синтетической FFI и реальные методы pinned gem на 401/WSMan fault без HTTP.
+`powershell.exe -NoProfile -NonInteractive -File test/lifecycle.ps1` выполняет
+копию target script в temporary directory: identity/ACL/signatures/services и
+process запуск мокируются, реальные службы/установщики не затрагиваются.
+Это не проверки реального DPAPI, Linux filesystem UID/ABI, Kerberos, WinRM,
+Authenticode, служб или установки. Перед rollout владелец должен проверить
+сборку Debian image, dependencies load и полный matrix на выделенных Windows-ПК:
+empty Install, duplicate refusal, old-server Reinstall, Remove, failed/timeout
+uninstall (без install), missing/corrupt/multiple agent, concurrent requests,
+restart/unknown и фактическое подключение в выбранную группу.
+
+Официальные источники: [WinRM 2.4.1 transport](https://github.com/WinRb/WinRM/blob/v2.4.1/lib/winrm/http/transport.rb),
+[winrm-fs 1.3.7](https://github.com/WinRb/winrm-fs/tree/v1.3.7),
+[MeshAgent installer](https://github.com/Ylianst/MeshAgent/blob/master/modules/agent-installer.js),
+[MIT kinit](https://web.mit.edu/kerberos/krb5-latest/doc/user/user_commands/kinit.html),
+[Docker Compose secrets](https://docs.docker.com/compose/how-tos/use-secrets/).
+WinRM и winrm-fs — Apache-2.0; точные transitive versions/checksums закреплены
+в Gemfile.lock. Evil-WinRM shell не запускается и его код не включается в plugin.
 
 ## Install (development)
 

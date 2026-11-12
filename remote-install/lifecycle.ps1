@@ -1,0 +1,115 @@
+param(
+    [ValidateSet('install', 'reinstall', 'remove')][string]$Mode,
+    [ValidatePattern('^[a-f0-9]{32}$')][string]$OperationId,
+    [string]$Installer,
+    [ValidatePattern('^[a-f0-9]{64}$')][string]$InstallerSha256
+)
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$started = $false
+$locked = $false
+$result = 'outcome_unknown'
+$root = Join-Path $env:ProgramData 'RemoraHQ-RemoteInstall'
+$lock = Join-Path $root 'active'
+try {
+    if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'admin_required' }
+    if (Test-Path -LiteralPath $root) {
+        if ((Get-Item -LiteralPath $root).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'unsafe_target_state' }
+    } else {
+        $null = New-Item -ItemType Directory -Path $root
+        # Local administrators/SYSTEM only; remote commands run with the push account.
+        $acl = New-Object Security.AccessControl.DirectorySecurity
+        $acl.SetAccessRuleProtection($true, $false)
+        $acl.SetOwner((New-Object Security.Principal.SecurityIdentifier('S-1-5-32-544')))
+        foreach ($sid in @('S-1-5-18', 'S-1-5-32-544')) {
+            $identity = New-Object Security.Principal.SecurityIdentifier($sid)
+            $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($identity, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+        }
+        Set-Acl -LiteralPath $root -AclObject $acl
+    }
+    $acl = Get-Acl -LiteralPath $root
+    $trustedSids = @('S-1-5-18', 'S-1-5-32-544')
+    if ($trustedSids -notcontains $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value) { throw 'unsafe_target_state' }
+    if (-not $acl.AreAccessRulesProtected) { throw 'unsafe_target_state' }
+    foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+        if ($rule.AccessControlType -eq 'Allow' -and $trustedSids -notcontains $rule.IdentityReference.Value) { throw 'unsafe_target_state' }
+    }
+    # Preserve unsigned MeshAgent Install support while verifying transport integrity.
+    if (-not $Installer -or -not (Test-Path -LiteralPath $Installer -PathType Leaf)) { throw 'installer_missing' }
+    if ((Get-FileHash -LiteralPath $Installer -Algorithm SHA256).Hash.ToLowerInvariant() -cne $InstallerSha256) { throw 'installer_unverified' }
+    # CreateNew is atomic across WinRM sessions, aliases and independent servers.
+    try {
+        $file = [IO.File]::Open($lock, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        $file.Dispose()
+        $locked = $true
+    } catch { throw 'target_busy_or_unknown' }
+    $receipt = Join-Path $root ($OperationId + '.receipt')
+    if (Test-Path -LiteralPath $receipt) { throw 'operation_already_seen' }
+    $file = [IO.File]::Open($receipt, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    $file.Dispose()
+
+    $agents = @()
+    foreach ($service in @(Get-CimInstance Win32_Service)) {
+        $match = [regex]::Match([string]$service.PathName, '^\s*(?:"(?<exe>[^"]+\.exe)"|(?<exe>.+?\.exe))(?:\s|$)', 'IgnoreCase')
+        $exe = if ($match.Success) { [Environment]::ExpandEnvironmentVariables($match.Groups['exe'].Value) } else { $null }
+        $knownName = $service.Name -eq 'Mesh Agent' -or $service.Name -eq 'meshagent' -or $service.DisplayName -eq 'Mesh Agent'
+        $policy = if ($exe) { [IO.Path]::ChangeExtension($exe, '.msh') } else { $null }
+        $meshPolicy = $policy -and (Test-Path -LiteralPath $policy -PathType Leaf) -and ((Get-Content -LiteralPath $policy -Raw) -match '(?m)^MeshID=') -and ((Get-Content -LiteralPath $policy -Raw) -match '(?m)^ServerID=')
+        if ($knownName -or $meshPolicy) { $agents += @{ Service = $service; Exe = $exe; Policy = $meshPolicy; PolicyFile = $policy; KnownName = $knownName } }
+    }
+    if ($agents.Count -gt 1) { throw 'agent_ambiguous' }
+    if ($Mode -eq 'install' -and $agents.Count -ne 0) { throw 'agent_exists' }
+    if ($Mode -ne 'install') {
+        if ($agents.Count -eq 0) { throw 'agent_not_found' }
+        # Destructive actions additionally require the current server's trusted publisher.
+        $currentSignature = Get-AuthenticodeSignature -LiteralPath $Installer
+        if ($currentSignature.Status -ne 'Valid' -or -not $currentSignature.SignerCertificate) { throw 'installer_unverified' }
+        $agent = $agents[0]
+        if (-not $agent.Exe -or -not (Test-Path -LiteralPath $agent.Exe -PathType Leaf)) { throw 'agent_binary_missing' }
+        if ($agent.Exe -notmatch '^[A-Za-z]:\\') { throw 'agent_unverified' }
+        $entry = Get-Item -LiteralPath $agent.Exe
+        if ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'agent_unverified' }
+        $ancestor = $entry.Directory
+        while ($ancestor) {
+            if ($ancestor.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'agent_unverified' }
+            $ancestor = $ancestor.Parent
+        }
+        # Never execute an arbitrary service command line or registry uninstall string.
+        $signature = Get-AuthenticodeSignature -LiteralPath $agent.Exe
+        if (-not ($agent.Policy -or $agent.KnownName) -or $signature.Status -ne 'Valid' -or -not $signature.SignerCertificate -or [Convert]::ToBase64String($signature.SignerCertificate.RawData) -cne [Convert]::ToBase64String($currentSignature.SignerCertificate.RawData)) { throw 'agent_unverified' }
+        $name = $agent.Service.Name
+        if ($name -notmatch '^[A-Za-z0-9 ._-]{1,128}$') { throw 'agent_unverified' }
+        $started = $true
+        # fulluninstall also cleans installed files; uninstall alone removes the service.
+        $process = Start-Process -FilePath $agent.Exe -ArgumentList @('-fulluninstall', ('--meshServiceName="' + $name + '"')) -PassThru -WindowStyle Hidden
+        if (-not $process.WaitForExit(60000)) { throw 'outcome_unknown' }
+        if ($process.ExitCode -ne 0) { throw 'removal_unconfirmed' }
+        # Upstream self-delete helper can wait 10 s after exit; never race it with a fresh install.
+        Start-Sleep -Seconds 12
+        for ($attempt = 0; $attempt -lt 40; $attempt++) {
+            $remaining = @(Get-CimInstance Win32_Service | Where-Object { $_.Name -eq $name -or $_.Name -eq ($name + 'Diagnostic') })
+            $filesRemain = (Test-Path -LiteralPath $agent.Exe) -or (Test-Path -LiteralPath $agent.PolicyFile)
+            if ($remaining.Count -eq 0 -and -not $filesRemain) { break }
+            Start-Sleep -Milliseconds 500
+        }
+        if ($remaining.Count -ne 0 -or $filesRemain) { throw 'removal_unconfirmed' }
+    }
+    if ($Mode -ne 'remove') {
+        if (-not $Installer -or -not (Test-Path -LiteralPath $Installer -PathType Leaf)) { throw 'installer_missing' }
+        # Even Install must guard the default service locally; old-server nodes are absent from this DB.
+        if (@(Get-CimInstance Win32_Service | Where-Object { $_.Name -eq 'Mesh Agent' -or $_.Name -eq 'meshagent' }).Count -ne 0) { throw 'agent_exists' }
+        $started = $true
+        $process = Start-Process -FilePath $Installer -ArgumentList '-fullinstall' -PassThru -WindowStyle Hidden
+        if (-not $process.WaitForExit(60000)) { throw 'outcome_unknown' }
+        if ($process.ExitCode -ne 0) { throw 'install_failed' }
+        $result = 'installer_completed'
+    } else { $result = 'removed' }
+    $started = $false
+} catch {
+    $allowed = @('admin_required', 'unsafe_target_state', 'target_busy_or_unknown', 'operation_already_seen', 'agent_ambiguous', 'agent_exists', 'agent_not_found', 'agent_binary_missing', 'agent_unverified', 'installer_missing', 'installer_unverified', 'install_failed', 'removal_unconfirmed')
+    if (-not $started -and $allowed -contains $_.Exception.Message) { $result = $_.Exception.Message }
+    # Once a destructive command starts, an exception is an unknown outcome.
+} finally {
+    if ($locked -and -not $started) { Remove-Item -LiteralPath $lock -Force -ErrorAction SilentlyContinue }
+}
+Write-Output ('ri-result:' + $result)

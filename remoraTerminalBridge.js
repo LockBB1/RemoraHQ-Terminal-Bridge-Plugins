@@ -187,7 +187,7 @@ var fs = require('fs');
 var path = require('path');
 
 var PLUGIN_SHORT_NAME = 'remoraTerminalBridge';
-var PLUGIN_VERSION = '0.12.0';
+var PLUGIN_VERSION = '0.13.0';
 var ALLOWED_SHELLS = ['cmd', 'powershell', 'bash', 'zsh'];
 // Only native User terminal contexts are issued by this plugin.
 var REMORA_PERMISSIONS_DOC_ID = 'remoraPermissions';
@@ -374,7 +374,7 @@ module.exports.remoraTerminalBridge = function (parent) {
         try {
             var p = riCredFilePath();
             if (!p) return null;
-            var j = JSON.parse(fs.readFileSync(p, 'utf8'));
+            var j = process.platform === 'linux' ? require('./remote-install/linux-vault.cjs').read(p) : JSON.parse(fs.readFileSync(p, 'utf8'));
             return (j && typeof j === 'object') ? j : null;
         } catch (e) { return null; }
     }
@@ -382,6 +382,7 @@ module.exports.remoraTerminalBridge = function (parent) {
     function riWriteCredMeta(meta) {
         var p = riCredFilePath();
         if (!p) throw new Error('no_datapath');
+        if (process.platform === 'linux') return require('./remote-install/linux-vault.cjs').write(p, meta);
         fs.writeFileSync(p, JSON.stringify(meta, null, 2), { encoding: 'utf8', mode: 0o600 });
     }
 
@@ -402,12 +403,12 @@ module.exports.remoraTerminalBridge = function (parent) {
         try {
             ps = cp.spawn('powershell.exe', [
                 '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
-                '-EncodedCommand', psEncode(script)
+                '-EncodedCommand', psEncode('[Console]::InputEncoding = New-Object Text.UTF8Encoding($false)\n' + script)
             ], { windowsHide: true });
         } catch (e) { return finish(e); }
         timer = setTimeout(function () { try { ps.kill(); } catch (x) { /* ignore */ } finish(new Error('powershell_timeout')); }, timeoutMs || 30000);
-        ps.stdout.on('data', function (d) { out += d.toString('utf8'); });
-        ps.stderr.on('data', function (d) { err += d.toString('utf8'); });
+        ps.stdout.on('data', function (d) { if (out.length < 65536) out += d.toString('utf8'); });
+        ps.stderr.on('data', function (d) { if (err.length < 4096) err += d.toString('utf8'); });
         ps.on('error', function (e) { finish(e); });
         ps.on('close', function (code) { finish(null, { code: code, stdout: out.trim(), stderr: err.trim() }); });
         try { if (stdinText != null) ps.stdin.write(String(stdinText) + '\n'); ps.stdin.end(); } catch (e) { /* ignore */ }
@@ -459,6 +460,8 @@ module.exports.remoraTerminalBridge = function (parent) {
         if (!isSuperAdmin(user)) return replyError(session, command, 'forbidden');
         var meta = riReadCredMeta();
         reply(session, command, {
+            lifecycleVersion: 1,
+            credentialStore: process.platform === 'linux' ? 'linux-aes-gcm' : 'windows-dpapi',
             configured: !!(meta && meta.blob),
             username: (meta && meta.username) || null,
             createdBy: (meta && meta.createdBy) || null,
@@ -474,10 +477,20 @@ module.exports.remoraTerminalBridge = function (parent) {
         var actor = user._id;
         var username = String(command.username || '');
         var password = String(command.password || '');
-        if (!RI_USERNAME_RE.test(username) || password.length === 0 || password.length > 1024) {
+        if (!RI_USERNAME_RE.test(username) || password.length === 0 || password.length > 1024 || /[\r\n\0]/.test(password)) {
             return replyError(session, command, 'invalid_input');
         }
         if (!riCredFilePath()) return replyError(session, command, 'no_datapath');
+        if (process.platform === 'linux') {
+            if (!/^[A-Za-z0-9._-]+@[A-Za-z0-9.-]+$/.test(username)) return replyError(session, command, 'principal_required');
+            try {
+                var sealed = require('./remote-install/linux-vault.cjs').seal(obj.meshServer.datapath, username, password);
+                riWriteCredMeta(Object.assign(sealed, { username: username, createdBy: actor, createdAt: new Date().toISOString(), lastTestAt: null, lastTestResult: null }));
+            } catch (_) { return replyError(session, command, 'protect_failed'); }
+            dispatchRiAudit(actor, { msg: 'Remote Install push account configured', actor: actor, status: 'success' });
+            return reply(session, command, { configured: true, username: username });
+        }
+        if (process.platform !== 'win32') return replyError(session, command, 'unsupported_platform');
         runPowerShell(riProtectScript(), password, function (err, res) {
             if (err || !res || res.code !== 0 || !RI_BLOB_RE.test(res.stdout || '')) {
                 dispatchRiAudit(actor, { msg: 'Remote Install account set failed', actor: actor, username: username, status: 'error' });
@@ -511,7 +524,7 @@ module.exports.remoraTerminalBridge = function (parent) {
         }
         var host = (command.testHost != null) ? String(command.testHost) : '';
         if (host && !RI_HOST_RE.test(host)) return replyError(session, command, 'invalid_host');
-        runPowerShell(riTestScript(meta.blob, meta.username, host || null), null, function (err, res) {
+        function complete(err, res) {
             var ok = !err && res && res.code === 0 && /^(winrm-ok|decrypt-ok)$/.test(res.stdout || '');
             var result = ok ? (host ? 'winrm-ok' : 'decrypt-ok') : 'failed';
             try {
@@ -525,7 +538,42 @@ module.exports.remoraTerminalBridge = function (parent) {
             // payload would clobber the 'ok' marker the client checks.
             if (ok) return reply(session, command, { ok: true, testResult: result });
             return replyError(session, command, host ? 'winrm_failed' : 'decrypt_failed');
-        });
+        }
+        if (process.platform === 'linux') {
+            if (!host) {
+                try { require('./remote-install/linux-vault.cjs').open(obj.meshServer.datapath, meta).fill(0); return complete(null, { code: 0, stdout: 'decrypt-ok' }); }
+                catch (_) { return complete(new Error('decrypt_failed')); }
+            }
+            return riLinuxRun(meta, host, 'probe', null, null, function (err, res) {
+                complete(err, res && { code: res.code, stdout: /winrm=True/.test(res.stdout) ? 'winrm-ok' : '' });
+            });
+        }
+        runPowerShell(riTestScript(meta.blob, meta.username, host || null), null, complete);
+    }
+
+    function riLinuxRun(meta, host, mode, localExe, operationId, cb, installerSha256) {
+        if (!/^[A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z0-9.-]+$/.test(host) || /^[\d.]+$/.test(host)) return cb(new Error('kerberos_fqdn_required'));
+        var password;
+        try { password = require('./remote-install/linux-vault.cjs').open(obj.meshServer.datapath, meta); }
+        catch (_) { return cb(new Error('decrypt_failed')); }
+        var child, done = false, out = '', timer, scratch;
+        function kill() { if (child) { try { process.kill(-child.pid, 'SIGKILL'); } catch (_) { try { child.kill('SIGKILL'); } catch (_) { /* already exited */ } } } }
+        function finish(err, res) {
+            if (done) return; done = true; clearTimeout(timer); password.fill(0);
+            if (scratch) { try { fs.rmSync(scratch, { recursive: true, force: true }); } catch (_) { err = new Error('cleanup_failed'); } }
+            cb(err, res);
+        }
+        try {
+            scratch = fs.mkdtempSync(path.join(require('os').tmpdir(), 'remora-ri-'));
+            fs.chmodSync(scratch, 0o700);
+            child = require('child_process').spawn('/usr/bin/ruby', [path.join(__dirname, 'remote-install', 'winrm.rb')], { detached: true, stdio: ['pipe', 'pipe', 'ignore'], env: { PATH: '/usr/bin:/bin', LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8', BUNDLE_GEMFILE: '/opt/remorahq-winrm/Gemfile', BUNDLE_PATH: '/opt/remorahq-winrm/vendor/bundle', BUNDLE_DEPLOYMENT: 'true', BUNDLE_FROZEN: 'true' } });
+            timer = setTimeout(function () { kill(); finish(new Error('outcome_unknown')); }, mode === 'probe' ? 30000 : 180000);
+            child.stdout.on('data', function (data) { if (out.length < 4096) out += data.toString('utf8'); });
+            child.on('error', function () { finish(new Error('transport_unavailable')); });
+            child.on('close', function (code) { finish(null, { code: code, stdout: out }); });
+            child.stdin.on('error', function () { /* close/error reports the result */ });
+            child.stdin.end(JSON.stringify({ username: meta.username, password: password.toString('utf8'), host: host, mode: mode, localExe: localExe, operationId: operationId, installerSha256: installerSha256, cacheDirectory: scratch, script: mode === 'probe' ? null : fs.readFileSync(path.join(__dirname, 'remote-install', 'lifecycle.ps1'), 'utf8') }));
+        } catch (_) { kill(); finish(new Error('transport_unavailable')); }
     }
 
     // ---- RC-15.14: Remote Install reachability + push --------------------------
@@ -548,9 +596,10 @@ module.exports.remoraTerminalBridge = function (parent) {
     // on the target group (super-admin implicit). Mirrors the native installer
     // download check; fail-closed on any missing server API.
     function hasGroupInstallRight(user, groupId) {
-        if (isSuperAdmin(user)) return true;
         var ws = obj.meshServer && obj.meshServer.webserver;
-        if (!ws || typeof ws.GetMeshRights !== 'function' || !ws.meshes || !ws.meshes[groupId]) return false;
+        if (!ws || !ws.meshes || !ws.meshes[groupId] || ws.meshes[groupId].mtype !== 2) return false;
+        if (isSuperAdmin(user)) return true;
+        if (typeof ws.GetMeshRights !== 'function') return false;
         return (ws.GetMeshRights(user, groupId) & MESHRIGHT_EDITMESH) !== 0;
     }
 
@@ -638,13 +687,15 @@ module.exports.remoraTerminalBridge = function (parent) {
             var bin = (domain.meshAgentBinaries && domain.meshAgentBinaries[binId]) || obj.meshServer.meshAgentBinaries[binId];
             if (!bin || !bin.path) return cb(new Error('agent_binary_missing'));
 
+            if (/[\r\n]/.test(mesh.name || '')) return cb(new Error('invalid_group'));
             var tmpDir = path.join(obj.meshServer.datapath, 'remora-ri-tmp');
-            try { fs.mkdirSync(tmpDir, { recursive: true }); } catch (e) { /* exists */ }
+            fs.mkdirSync(tmpDir, { recursive: true, mode: 0o700 });
             var localExe = path.join(tmpDir, 'ra-' + crypto.randomBytes(8).toString('hex') + '.exe');
 
-            var outStream = fs.createWriteStream(localExe);
+            var outStream = fs.createWriteStream(localExe, { flags: 'wx', mode: 0o600 });
             var settled = false;
-            function done(err) { if (settled) return; settled = true; cb(err, err ? null : localExe); }
+            var timer = setTimeout(function () { if (outStream.destroy) outStream.destroy(); done(new Error('installer_timeout')); }, 30000);
+            function done(err) { if (settled) return; settled = true; clearTimeout(timer); if (err) riCleanup(localExe); cb(err, err ? null : localExe); }
             outStream.on('error', function (e) { done(e); });
             outStream.on('close', function () { done(null); });
             try {
@@ -677,30 +728,34 @@ module.exports.remoraTerminalBridge = function (parent) {
         ].join("\n");
     }
 
-    // Push: open one PSSession, copy the generated agent, run -fullinstall, clean up.
-    function riRunScript(blob, username, host, localExe) {
+    // Push: short static launcher; lifecycle and metadata arrive over stdin.
+    function riRunScript() {
         return [
             "$ErrorActionPreference='Stop'",
             "try {",
+            "  $job = [Console]::In.ReadLine() | ConvertFrom-Json",
             "  Add-Type -AssemblyName System.Security",
-            "  $enc=[Convert]::FromBase64String('" + blob + "')",
+            "  $enc=[Convert]::FromBase64String($job.blob)",
             "  $e=[Text.Encoding]::UTF8.GetBytes('" + REMORA_RI_ENTROPY + "')",
             "  $dec=[Security.Cryptography.ProtectedData]::Unprotect($enc,$e,[Security.Cryptography.DataProtectionScope]::LocalMachine)",
             "  $pw=[Text.Encoding]::UTF8.GetString($dec); $sec=ConvertTo-SecureString $pw -AsPlainText -Force; $pw=$null",
-            "  $cred=New-Object System.Management.Automation.PSCredential('" + username + "',$sec)",
-            "  $s=New-PSSession -ComputerName '" + host + "' -Authentication Negotiate -Credential $cred -ErrorAction Stop",
+            "  $cred=New-Object System.Management.Automation.PSCredential($job.username,$sec)",
+            "  $s=New-PSSession -ComputerName $job.host -Authentication Negotiate -Credential $cred -ErrorAction Stop",
             "  try {",
+            "    $rt = $null",
             "    $rt = Invoke-Command -Session $s -ScriptBlock { Join-Path $env:TEMP ('ra-' + [guid]::NewGuid().ToString('N') + '.exe') }",
-            "    Copy-Item -ToSession $s -Path '" + localExe.replace(/'/g, "''") + "' -Destination $rt -Force",
-            "    $code = Invoke-Command -Session $s -ScriptBlock { param($p) & $p -fullinstall | Out-Null; $c=$LASTEXITCODE; Start-Sleep -Seconds 1; Remove-Item $p -Force -ErrorAction SilentlyContinue; $c } -ArgumentList $rt",
-            "    Write-Output ('install-exit:' + $code)",
+            "    try {",
+            "      Copy-Item -ToSession $s -LiteralPath $job.localExe -Destination $rt -Force",
+            "      Invoke-Command -Session $s -ScriptBlock ([scriptblock]::Create($job.script)) -ArgumentList $job.mode,$job.operationId,$rt,$job.installerSha256",
+            "    } finally { if ($rt) { Invoke-Command -Session $s -ScriptBlock { param($p) Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue } -ArgumentList $rt -ErrorAction SilentlyContinue } }",
             "  } finally { Remove-PSSession $s }",
-            "} catch { Write-Error $_.Exception.Message; exit 1 }"
+            "} catch { Write-Output 'ri-result:outcome_unknown'; exit 1 }"
         ].join("\n");
     }
 
     function handleRiReachability(command, dbGet, session) {
         var user = dbGet && dbGet.user;
+        if (!user || !user._id) return replyError(session, command, 'auth_required');
         hasRemoteInstallPermission(user, function (allowed) {
             if (!allowed) {
                 dispatchRiAudit(user && user._id, { msg: 'Remote Install reachability denied', actor: user && user._id, status: 'denied' });
@@ -722,7 +777,7 @@ module.exports.remoraTerminalBridge = function (parent) {
             if (!meta || !meta.blob || !RI_BLOB_RE.test(meta.blob) || !RI_USERNAME_RE.test(meta.username || '')) {
                 return replyError(session, command, 'not_configured');
             }
-            runPowerShell(riReachabilityScript(meta.blob, meta.username, host), null, function (err, res) {
+            function complete(err, res) {
                 if (err || !res) return replyError(session, command, 'reachability_failed');
                 var out = res.stdout || '';
                 var ping = /ping=True/i.test(out);
@@ -732,13 +787,48 @@ module.exports.remoraTerminalBridge = function (parent) {
                 // scan error here is non-fatal (the run path hard-blocks anyway).
                 riFindExistingNode(user, host, function (scanErr, match) {
                     reply(session, command, {
+                        lifecycleVersion: 1,
+                        pingChecked: process.platform !== 'linux',
                         reachable: ping, winrm: winrm,
                         existing: !!(match && !scanErr),
                         existingVisible: match ? match.visible : undefined,
                         existingGroup: (match && match.groupName) || undefined
                     });
                 });
-            });
+            }
+            if (process.platform === 'linux') return riLinuxRun(meta, host, 'probe', null, null, complete);
+            runPowerShell(riReachabilityScript(meta.blob, meta.username, host), null, complete);
+        });
+    }
+
+    var riActive = Object.create(null);
+    function riOperationPath(host) {
+        var directory = path.join(obj.meshServer.datapath, 'remora-ri-operations');
+        fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+        return path.join(directory, crypto.createHash('sha256').update(host.toLowerCase().replace(/\.$/, '')).digest('hex') + '.json');
+    }
+    function riWriteOperation(file, record) {
+        var temporary = file + '.' + crypto.randomBytes(8).toString('hex') + '.tmp';
+        try {
+            fs.writeFileSync(temporary, JSON.stringify(record), { flag: 'wx', mode: 0o600 });
+            fs.renameSync(temporary, file);
+        } finally { try { fs.unlinkSync(temporary); } catch (_) { /* renamed */ } }
+    }
+
+    function handleRiOperationStatus(command, dbGet, session) {
+        var user = dbGet && dbGet.user;
+        if (!user || !user._id) return replyError(session, command, 'auth_required');
+        hasRemoteInstallPermission(user, function (allowed) {
+            var host = String(command.host || ''), groupId = String(command.groupId || '');
+            if (!allowed || !RI_GROUP_RE.test(groupId) || !hasGroupInstallRight(user, groupId)) return replyError(session, command, 'permission_denied');
+            if (!RI_HOST_RE.test(host)) return replyError(session, command, 'invalid_host');
+            if (!riRateLimitOk(user._id, riReachTimes, 90)) return replyError(session, command, 'rate_limited');
+            try {
+                var file = riOperationPath(host), record = JSON.parse(fs.readFileSync(file, 'utf8'));
+                if (record.groupId !== groupId) return replyError(session, command, 'permission_denied');
+                if (record.state === 'running' && !riActive[file]) record.state = 'unknown';
+                reply(session, command, { state: record.state, outcome: record.outcome, mode: record.mode, operationId: record.operationId });
+            } catch (_) { replyError(session, command, 'operation_status_unavailable'); }
         });
     }
 
@@ -753,9 +843,13 @@ module.exports.remoraTerminalBridge = function (parent) {
             }
             var host = String(command.host || '');
             var groupId = String(command.groupId || '');
+            var mode = command.mode == null ? 'install' : command.mode;
+            if (['install', 'reinstall', 'remove'].indexOf(mode) === -1) return replyError(session, command, 'invalid_mode');
             var installFlags = (typeof command.installFlags === 'number') ? command.installFlags : 0;
             if (!RI_HOST_RE.test(host)) return replyError(session, command, 'invalid_host');
             if (!RI_GROUP_RE.test(groupId)) return replyError(session, command, 'invalid_group');
+            if (!Number.isInteger(installFlags) || installFlags < 0 || installFlags > 3) return replyError(session, command, 'invalid_input');
+            if (mode !== 'install' && command.confirmedHost !== host) return replyError(session, command, 'confirmation_required');
 
             // Per-mesh authz: caller must hold install rights on the target group
             // (cross-mesh priv-esc guard — the "visible groups only" rule was
@@ -769,46 +863,88 @@ module.exports.remoraTerminalBridge = function (parent) {
                 dispatchRiAudit(actor, { msg: 'Remote Install push rate-limited', actor: actor, host: host, status: 'denied' });
                 return replyError(session, command, 'rate_limited');
             }
+            // shortcut: process-local worker cap; target locks also coordinate independent servers.
+            if (Object.keys(riActive).length >= 4) return replyError(session, command, 'too_many_operations');
             var meta = riReadCredMeta();
             if (!meta || !meta.blob || !RI_BLOB_RE.test(meta.blob) || !RI_USERNAME_RE.test(meta.username || '')) {
                 return replyError(session, command, 'not_configured');
             }
 
+            if (process.platform !== 'win32' && process.platform !== 'linux') return replyError(session, command, 'unsupported_platform');
+            if (process.platform === 'linux' && (!host.includes('.') || /^[\d.]+$/.test(host))) return replyError(session, command, 'kerberos_fqdn_required');
+            var operationId = command.operationId == null ? crypto.randomBytes(16).toString('hex') : command.operationId, operationFile, record;
+            if (typeof operationId !== 'string' || !/^[a-f0-9]{32}$/.test(operationId)) return replyError(session, command, 'invalid_input');
+            try {
+                operationFile = riOperationPath(host);
+                // Exclusive sidecar covers both the state check and the write across processes.
+                fs.writeFileSync(operationFile + '.lock', operationId, { flag: 'wx', mode: 0o600 });
+                try {
+                    var previous = JSON.parse(fs.readFileSync(operationFile, 'utf8'));
+                    if (previous.state === 'running' || previous.state === 'unknown') return replyError(session, command, 'target_busy_or_unknown');
+                    if (previous.operationId === operationId) {
+                        fs.unlinkSync(operationFile + '.lock');
+                        if (previous.groupId !== groupId || previous.mode !== mode || previous.actor !== actor) return replyError(session, command, 'invalid_input');
+                        if (previous.state === 'failed') return replyError(session, command, previous.outcome);
+                        return reply(session, command, { ok: true, host: host, group: groupId, operationId: operationId, mode: mode, outcome: previous.outcome });
+                    }
+                } catch (e) { if (e.code !== 'ENOENT') throw e; }
+                record = { operationId: operationId, actor: actor, groupId: groupId, mode: mode, state: 'running', outcome: null };
+                riWriteOperation(operationFile, record);
+                riActive[operationFile] = true;
+            } catch (_) { return replyError(session, command, 'target_busy_or_unknown'); }
+
+            function finish(outcome, error) {
+                if (!riActive[operationFile]) return;
+                delete riActive[operationFile];
+                record.state = outcome === 'outcome_unknown' ? 'unknown' : (error ? 'failed' : 'completed');
+                record.outcome = outcome;
+                try {
+                    riWriteOperation(operationFile, record);
+                    if (record.state !== 'unknown') fs.unlinkSync(operationFile + '.lock');
+                } catch (_) { record.state = 'unknown'; error = true; outcome = 'outcome_unknown'; }
+                dispatchRiAudit(actor, { msg: 'Remote Install ' + mode + ': ' + outcome, actor: actor, host: host, group: groupId, operationId: operationId, mode: mode, status: record.state === 'unknown' ? 'unknown' : (error ? 'error' : 'success') });
+                if (error) return replyError(session, command, outcome, { operationId: operationId });
+                reply(session, command, { ok: true, host: host, group: groupId, operationId: operationId, mode: mode, outcome: outcome });
+            }
+
+            dispatchRiAudit(actor, { msg: 'Remote Install ' + mode + ' started', actor: actor, host: host, group: groupId, mode: mode, operationId: operationId, status: 'started' });
+
             // RC-15.RINST-1 (#14) — block a redundant push if an agent is already
             // registered for this host (possibly in a group the operator cannot
             // see). Fail-closed: if the scan cannot complete, refuse rather than
             // risk a duplicate install.
+            if (mode !== 'install') return proceedInstall();
             riFindExistingNode(user, host, function (scanErr, match) {
                 if (scanErr) {
-                    dispatchRiAudit(actor, { msg: 'Remote Install dup-check failed', actor: actor, host: host, group: groupId, status: 'error', detail: scanErr.message });
-                    return replyError(session, command, 'dup_check_failed');
+                    dispatchRiAudit(actor, { msg: 'Remote Install dup-check failed', actor: actor, host: host, group: groupId, status: 'error' });
+                    return finish('dup_check_failed', true);
                 }
                 if (match) {
                     dispatchRiAudit(actor, { msg: 'Remote Install push blocked (agent already present)', actor: actor, host: host, group: groupId, status: 'blocked', existingVisible: match.visible });
-                    return replyError(session, command, 'agent_exists', { existingVisible: match.visible, existingGroup: match.groupName || undefined });
+                    return finish('agent_exists', true);
                 }
                 proceedInstall();
             });
 
             function proceedInstall() {
-            riGenerateInstaller(groupId, installFlags, function (genErr, localExe) {
-                if (genErr || !localExe) {
-                    dispatchRiAudit(actor, { msg: 'Remote Install installer-gen failed', actor: actor, host: host, group: groupId, status: 'error', detail: genErr && genErr.message });
-                    return replyError(session, command, 'installer_gen_failed');
-                }
-                runPowerShell(riRunScript(meta.blob, meta.username, host, localExe), null, function (err, res) {
+            function generated(genErr, localExe) {
+                if (genErr || !localExe) return finish('installer_gen_failed', true);
+                var installerSha256;
+                try { installerSha256 = crypto.createHash('sha256').update(fs.readFileSync(localExe)).digest('hex'); }
+                catch (_) { riCleanup(localExe); return finish('installer_gen_failed', true); }
+                function complete(err, res) {
                     riCleanup(localExe);
-                    var m = res && /install-exit:(-?\d+)/.exec(res.stdout || '');
-                    var exitCode = m ? parseInt(m[1], 10) : null;
-                    var ok = !err && res && res.code === 0 && exitCode === 0;
-                    dispatchRiAudit(actor, {
-                        msg: ok ? 'Remote Install push succeeded' : 'Remote Install push failed',
-                        actor: actor, host: host, group: groupId, exitCode: exitCode, status: ok ? 'success' : 'error'
-                    });
-                    if (ok) return reply(session, command, { ok: true, host: host, group: groupId });
-                    return replyError(session, command, 'install_failed');
-                }, 180000); // push can take a while: download already local, copy + -fullinstall
-            });
+                    var m = res && /ri-result:([a-z_]+)/.exec(res.stdout || '');
+                    var outcome = !err && res && res.code === 0 && m ? m[1] : 'outcome_unknown';
+                    var known = ['installer_completed', 'removed', 'agent_exists', 'agent_not_found', 'agent_binary_missing', 'agent_unverified', 'agent_ambiguous', 'admin_required', 'unsafe_target_state', 'target_busy_or_unknown', 'operation_already_seen', 'installer_missing', 'installer_unverified', 'removal_unconfirmed', 'install_failed'];
+                    if (known.indexOf(outcome) < 0) outcome = 'outcome_unknown';
+                    finish(outcome, outcome !== 'installer_completed' && outcome !== 'removed');
+                }
+                if (process.platform === 'linux') return riLinuxRun(meta, host, mode, localExe, operationId, complete, installerSha256);
+                try { runPowerShell(riRunScript(), JSON.stringify({ blob: meta.blob, username: meta.username, host: host, localExe: localExe, mode: mode, operationId: operationId, installerSha256: installerSha256, script: fs.readFileSync(path.join(__dirname, 'remote-install', 'lifecycle.ps1'), 'utf8') }), complete, 180000); }
+                catch (_) { complete(new Error('transport_unavailable')); }
+            }
+            riGenerateInstaller(groupId, installFlags, generated);
             } // proceedInstall
         });
     }
@@ -887,6 +1023,7 @@ module.exports.remoraTerminalBridge = function (parent) {
         if (action === 'remoteInstall.testAccount') return handleRiTestAccount(command, dbGet, session);
         if (action === 'remoteInstall.reachability') return handleRiReachability(command, dbGet, session);
         if (action === 'remoteInstall.run') return handleRiRun(command, dbGet, session);
+        if (action === 'remoteInstall.status') return handleRiOperationStatus(command, dbGet, session);
         if (action === 'openAdmin') { delete command.password; return replyError(session, command, 'terminal_admin_unavailable'); }
         if (action !== 'open') return replyError(session, command, 'unknown_pluginaction');
 
