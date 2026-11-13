@@ -39,3 +39,17 @@ module RemoraNoShellReplay
   end
 end
 WinRM::Shells::Base.prepend(RemoraNoShellReplay)
+
+# Base#run cleans up in ensure before returning the completed response.
+module RemoraCommandCleanupSafety
+  attr_reader :remora_command_cleanup_failed
+
+  private
+
+  def cleanup_command(command_id)
+    super
+  rescue StandardError
+    @remora_command_cleanup_failed = true
+  end
+end
+WinRM::Shells::Base.prepend(RemoraCommandCleanupSafety)

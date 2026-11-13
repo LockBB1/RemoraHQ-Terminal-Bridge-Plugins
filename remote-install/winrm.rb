@@ -89,7 +89,7 @@ begin
           marker = result.exitcode == 0 ? result.stdout.lines.map(&:strip).grep(/\Ari-result:[a-z_]+\z/).last : nil
           raise 'lifecycle unconfirmed' unless marker && marker != 'ri-result:outcome_unknown'
           lifecycle_marker = marker
-          lifecycle_cleanup = 'confirmed' if result.stdout.lines.map(&:strip).include?('ri-cleanup:confirmed')
+          lifecycle_cleanup = 'confirmed' if result.stdout.lines.map(&:strip).include?('ri-cleanup:confirmed') && !shell.remora_command_cleanup_failed
         ensure
           begin
             if remote
@@ -99,6 +99,7 @@ begin
           rescue StandardError
             lifecycle_cleanup = 'unknown'
           end
+          lifecycle_cleanup = 'unknown' if shell.remora_command_cleanup_failed
         end
       end
     end

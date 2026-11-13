@@ -14,7 +14,7 @@ family.
 | Source repo folder | `RemoraHQ-Terminal-Bridge-Plugins` |
 | Deploy folder under Mesh | `meshcentral/plugins/remoraTerminalBridge` |
 
-## Terminal contract (Bridge 0.14.2)
+## Terminal contract (Bridge 0.14.3)
 
 The `open` action accepts `nodeId`, `shell` (`cmd`, `powershell`, `bash`,
 `zsh`) and the optional `context: "user"`. It returns a session identifier,
@@ -34,7 +34,7 @@ agent behavior are separate and unchanged; this does not close that route.
 Deployments need matching plugin and SPA versions. The `.setup` snapshot is not
 updated by edits to this checkout.
 
-## Remote Install 0.14.2
+## Remote Install 0.14.3
 
 Цели — Windows x64 с Windows PowerShell 5.1 и WinRM. Сервер — Windows
 (сохранённый DPAPI LocalMachine/Negotiate путь) либо Debian (Ruby WinRM,
@@ -125,7 +125,12 @@ timeout, потерянный маркер и сбой после начала d
 дополнительной защитой от повторного исполнения.
 
 Подтверждённый результат lifecycle сохраняется при последующем сбое удаления
-временных файлов или закрытия WinRM-сессии. Дополнительное optional поле
+временных файлов или закрытия WinRM-сессии. Guard также сохраняет полный ответ
+`Base#run`, если внутренний `cleanup_command` WinRM выбрасывает исключение после
+чтения ответа; в этом случае очистка отмечается `unknown`. Успех по-прежнему
+требует возвращённого ответа с нулевым exit code и допустимым lifecycle-маркером:
+ошибка чтения или отсутствующий exit code не превращаются в успех.
+Дополнительное optional поле
 `cleanup: confirmed | unknown` в run/status и аудите сообщает об уборке отдельно
 от `outcome`; SPA показывает предупреждение при `unknown`. Статус `confirmed`
 требует подтверждения очистки защищённой копии и target lock, переданного EXE,
@@ -217,7 +222,9 @@ filesystem/process/DB fixtures, включая Linux timeout. `npm run test:kerb
 требует Ruby и installed pinned WinRM; проверяет запуск helper с конфликтующей
 версией logger в изолированном bundle, обработку диагностики и cleanup,
 Ruby dispatch GSSAPI guard
-с синтетической FFI и реальные методы pinned gem на 401/WSMan fault без HTTP.
+с синтетической FFI и реальные методы pinned gem на 401/WSMan fault без HTTP,
+а также сохранение полного ответа и исходной ошибки чтения при сбое внутреннего
+command cleanup без повторного запуска команды.
 `powershell.exe -NoProfile -NonInteractive -File test/diagnostic.ps1` проверяет
 независимую классификацию SHA-256 и подписи с синтетическими результатами.
 `powershell.exe -NoProfile -NonInteractive -File test/lifecycle.ps1` выполняет

@@ -38,11 +38,13 @@ Dir.mktmpdir('remora-diag-test-') do |dir|
         def initialize(*) = nil
         def shell(*)
           shell = Object.new
+          def shell.remora_command_cleanup_failed = @cleanup_failed || ENV['RI_TEST_CASE'] == 'lifecycle_inner_cleanup'
           def shell.run(command)
             if command.start_with?('Join-Path')
               text = 'C:\\Windows\\Temp\\fixture.exe'
             elsif command.start_with?('Remove-Item')
               raise 'private lifecycle cleanup error' if ENV['RI_TEST_CASE'] == 'lifecycle_cleanup'
+              @cleanup_failed = true if ENV['RI_TEST_CASE'] == 'lifecycle_temp_inner_cleanup'
               text = 'ri-temp:removed'
             elsif command.include?("-Mode 'remove'")
               raise 'private lifecycle error' if ENV['RI_TEST_CASE'] == 'lifecycle_missing'
@@ -55,7 +57,13 @@ Dir.mktmpdir('remora-diag-test-') do |dir|
             else
               text = 'ri-diagnostic:match:valid:present'
             end
-            code = command.include?("-Mode 'remove'") && ENV['RI_TEST_CASE'] == 'lifecycle_nonzero' ? 1 : 0
+            code = if command.include?("-Mode 'remove'") && ENV['RI_TEST_CASE'] == 'lifecycle_missing_exit'
+                     nil
+                   elsif command.include?("-Mode 'remove'") && ENV['RI_TEST_CASE'] == 'lifecycle_nonzero'
+                     1
+                   else
+                     0
+                   end
             Struct.new(:stdout, :exitcode).new(text, code)
           end
           yield shell
@@ -78,10 +86,13 @@ Dir.mktmpdir('remora-diag-test-') do |dir|
   end
   lifecycle_job = JSON.parse(job).merge('mode' => 'remove').to_json
   { 'lifecycle_cleanup' => [0, "ri-result:removed\nri-cleanup:unknown"],
+    'lifecycle_inner_cleanup' => [0, "ri-result:removed\nri-cleanup:unknown"],
+    'lifecycle_temp_inner_cleanup' => [0, "ri-result:removed\nri-cleanup:unknown"],
     'lifecycle_ok' => [0, "ri-result:removed\nri-cleanup:confirmed"],
     'lifecycle_target_cleanup' => [0, "ri-result:removed\nri-cleanup:unknown"],
     'lifecycle_close' => [0, "ri-result:removed\nri-cleanup:unknown"],
     'lifecycle_nonzero' => [1, 'ri-result:outcome_unknown'],
+    'lifecycle_missing_exit' => [1, 'ri-result:outcome_unknown'],
     'lifecycle_missing' => [1, 'ri-result:outcome_unknown'] }.each do |mode, (code, marker)|
     env = { 'RUBYOPT' => "-r#{shim_path.tr('\\', '/')}", 'RI_TEST_CASE' => mode }
     stdout, stderr, status = Open3.capture3(env, RbConfig.ruby, File.join(dir, 'winrm.rb'), stdin_data: lifecycle_job)

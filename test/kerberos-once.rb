@@ -70,3 +70,46 @@ rescue RuntimeError => error
 end
 raise 'command was retried' unless commands == 1
 puts 'Pinned WinRM 2.4.1 WSMan shell reset: one command, no replay PASS (synthetic command fault)'
+
+# Exercise Base#run's real ensure after read_output, rather than mocking shell.run.
+module WinRM
+  class WinRMHTTPTransportError < StandardError; end
+  module WSMV
+    class CleanupCommand
+      def initialize(*) = nil
+      def build = 'synthetic cleanup'
+    end
+  end
+end
+[:completed, :receive_error].each do |scenario|
+  shell = WinRM::Shells::Base.allocate
+  shell.instance_variable_set(:@shell_id, 'synthetic')
+  shell.instance_variable_set(:@logger, Logger.new(File::NULL, level: Logger::FATAL))
+  transport = Object.new
+  transport.define_singleton_method(:send_request) { |*| raise 'synthetic_cleanup_error' }
+  shell.instance_variable_set(:@transport, transport)
+  commands = 0
+  shell.define_singleton_method(:send_command) { |*| commands += 1; 'synthetic' }
+  shell.define_singleton_method(:command_output_message) { |*| 'synthetic' }
+  expected = Struct.new(:stdout, :exitcode).new("ri-result:installer_completed\r\nri-cleanup:confirmed\r\n", 0)
+  reader = Object.new
+  reader.define_singleton_method(:read_output) do |*|
+    raise 'synthetic_receive_error' if scenario == :receive_error
+
+    expected
+  end
+  shell.define_singleton_method(:response_reader) { reader }
+  if scenario == :completed
+    raise 'Completed response was replaced' unless shell.run('synthetic') == expected
+  else
+    begin
+      shell.run('synthetic')
+      raise 'Incomplete read was accepted'
+    rescue RuntimeError => error
+      raise unless error.message == 'synthetic_receive_error'
+    end
+  end
+  raise 'Command cleanup failure was hidden' unless shell.remora_command_cleanup_failed
+  raise 'Command was replayed after cleanup failure' unless commands == 1
+end
+puts 'Pinned WinRM 2.4.1 inner cleanup: preserve completed response and receive failure, no replay PASS'
