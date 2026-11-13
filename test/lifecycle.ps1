@@ -72,7 +72,8 @@ function Invoke-Case($name, $mode, $existing, $removal, $timeout, $cleanup, $exp
     $expectedSha = if ($name -eq 'hash-mismatch') { '0' * 64 } else { $sha }
     $result = & $copy -Mode $mode -OperationId ([guid]::NewGuid().ToString('N')) -Installer $installer -InstallerSha256 $expectedSha
     if ($name -eq 'reparse-parent') { [IO.Directory]::Delete($junction) }
-    if (($result -join '') -ne ('ri-result:' + $expected)) { throw "$name returned $result" }
+    if (@($result | Where-Object { $_ -like 'ri-result:*' }) -cne ('ri-result:' + $expected)) { throw "$name returned $result" }
+    if ($result -notcontains ('ri-cleanup:' + $(if ($expected -eq 'outcome_unknown') { 'unknown' } else { 'confirmed' }))) { throw "$name cleanup result missing" }
     if ($global:riCalls.Count -ne $count) { throw "$name made $($global:riCalls.Count) process calls" }
     if ($name -eq 'reinstall' -and (-not $global:riGrace -or $global:riCalls[0] -notmatch 'fulluninstall' -or $global:riCalls[1] -ne '-fullinstall')) { throw 'reinstall ordering or cleanup wait failed' }
     if ($timeout -and -not (Test-Path -LiteralPath (Join-Path $env:ProgramData 'RemoraHQ-RemoteInstall/active'))) { throw 'unknown result must keep target lock' }

@@ -28,7 +28,7 @@ function fixture(options = {}) {
         },
         mkdirSync() {}, createWriteStream() { return new EventEmitter(); },
         mkdtempSync(prefix) { return prefix + 'fixture'; }, chmodSync() {},
-        rmSync(file) { scratchRemoved.push(file); },
+        rmSync(file) { if (options.scratchCleanupFailure) throw new Error('private cleanup failure'); scratchRemoved.push(file); },
         unlinkSync(file) { if (options.unlinkFailure && file.endsWith('.exe')) throw new Error('fixture cleanup failure'); removed.push(file); files.delete(file); },
         renameSync(from, to) { files.set(to, files.get(from)); files.delete(from); },
     };
@@ -214,6 +214,26 @@ test('an unknown outcome persists, blocks another run and can be read without an
     assert.equal(state.state, 'unknown'); assert.equal(state.operationId, first.operationId);
     assert.equal(f.spawns.length, 1); assert.equal(f.audits.at(-1).status, 'unknown');
     assert.equal((await f.request({ pluginaction: 'remoteInstall.status', groupId: 'mesh//hidden' })).error, 'permission_denied');
+});
+
+test('confirmed removal and uncertain cleanup remain distinct in replies, replay, status and audit', async () => {
+    for (const options of [
+        { diagnosticMarker: 'ri-result:removed\nri-cleanup:unknown' },
+        { diagnosticMarker: 'ri-result:removed\nri-cleanup:confirmed', unlinkFailure: true },
+        { diagnosticMarker: 'ri-result:removed\nri-cleanup:confirmed', linux: true, scratchCleanupFailure: true },
+        { diagnosticMarker: 'ri-result:removed\nri-cleanup:confirmed' },
+    ]) {
+        const f = fixture(options), operationId = 'c'.repeat(32);
+        const command = { mode: 'remove', confirmedHost: 'host.example.invalid', operationId };
+        const result = await f.request(command);
+        const expected = options.unlinkFailure || options.scratchCleanupFailure || options.diagnosticMarker.endsWith('unknown') ? 'unknown' : 'confirmed';
+        assert.equal(result.ok, true); assert.equal(result.outcome, 'removed'); assert.equal(result.cleanup, expected);
+        const status = await f.request({ pluginaction: 'remoteInstall.status' });
+        assert.equal(status.state, 'completed'); assert.equal(status.outcome, 'removed'); assert.equal(status.cleanup, expected);
+        assert.equal((await f.request(command)).cleanup, expected);
+        assert.equal(f.audits.at(-1).cleanup, expected);
+        assert.equal(f.spawns.length, 1);
+    }
 });
 
 test('concurrent runs cannot share a target and completion is replayed for the same intent', async () => {

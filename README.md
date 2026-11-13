@@ -14,7 +14,7 @@ family.
 | Source repo folder | `RemoraHQ-Terminal-Bridge-Plugins` |
 | Deploy folder under Mesh | `meshcentral/plugins/remoraTerminalBridge` |
 
-## Terminal contract (Bridge 0.14.1)
+## Terminal contract (Bridge 0.14.2)
 
 The `open` action accepts `nodeId`, `shell` (`cmd`, `powershell`, `bash`,
 `zsh`) and the optional `context: "user"`. It returns a session identifier,
@@ -34,7 +34,7 @@ agent behavior are separate and unchanged; this does not close that route.
 Deployments need matching plugin and SPA versions. The `.setup` snapshot is not
 updated by edits to this checkout.
 
-## Remote Install 0.14.1
+## Remote Install 0.14.2
 
 Цели — Windows x64 с Windows PowerShell 5.1 и WinRM. Сервер — Windows
 (сохранённый DPAPI LocalMachine/Negotiate путь) либо Debian (Ruby WinRM,
@@ -118,14 +118,23 @@ Run принимает `host`, `groupId`, необязательные `installF
 означает завершение installer, **не подтверждённое подключение агента**;
 проверьте группу отдельно. `removed` подтверждает отсутствие служб и старых EXE/MSH, без
 обещания удаления каждой оставшейся папки/registry entry. Ошибка соединения,
-timeout, потерянный маркер и сбой после начала destructive действия — неизвестный
+timeout, потерянный маркер и сбой после начала destructive действия до подтверждения результата — неизвестный
 исход. Ни UI, ни helper не повторяют его автоматически. Локальный guard
 закреплённой WinRM запрещает повторную Kerberos инициализацию после 401 и
 повтор command при WSMan shell reset. Постоянный receipt intent на цели служит
 дополнительной защитой от повторного исполнения.
 
+Подтверждённый результат lifecycle сохраняется при последующем сбое удаления
+временных файлов или закрытия WinRM-сессии. Дополнительное optional поле
+`cleanup: confirmed | unknown` в run/status и аудите сообщает об уборке отдельно
+от `outcome`; SPA показывает предупреждение при `unknown`. Статус `confirmed`
+требует подтверждения очистки защищённой копии и target lock, переданного EXE,
+закрытия сессии и серверных временных файлов. При ошибке до подтверждённого
+маркера исход остаётся `unknown`; завершённый процесс сам по себе не заменяет
+подтверждение lifecycle. Поле отсутствует в старых сохранённых записях.
+
 `remoteInstall.status {host, groupId}` — read-only статус последнего intent:
-`running`, `completed`, `failed`, `unknown`, `outcome`, `mode`, `operationId`.
+`running`, `completed`, `failed`, `unknown`, `outcome`, `mode`, `operationId`, optional `cleanup`.
 После потери связи используйте Refresh outcome; неизвестный результат
 блокирует новый run. Локальные `remora-ri-operations/` записи/lock сохраняются
 в datapath до разрешения; после перезапуска незавершённый `running` читается

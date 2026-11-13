@@ -560,7 +560,10 @@ module.exports.remoraTerminalBridge = function (parent) {
         function kill() { if (child) { try { process.kill(-child.pid, 'SIGKILL'); } catch (_) { try { child.kill('SIGKILL'); } catch (_) { /* already exited */ } } } }
         function finish(err, res) {
             if (done) return; done = true; clearTimeout(timer); password.fill(0);
-            if (scratch) { try { fs.rmSync(scratch, { recursive: true, force: true }); } catch (_) { err = new Error('cleanup_failed'); } }
+            if (scratch) { try { fs.rmSync(scratch, { recursive: true, force: true }); } catch (_) {
+                if (!err && res && res.code === 0 && /^ri-result:(?!outcome_unknown)[a-z_]+$/m.test(res.stdout || '')) res.stdout += '\nri-cleanup:unknown';
+                else err = new Error('cleanup_failed');
+            } }
             cb(err, res);
         }
         try {
@@ -708,7 +711,7 @@ module.exports.remoraTerminalBridge = function (parent) {
         } catch (e) { cb(e); }
     }
 
-    function riCleanup(localExe) { if (localExe) { try { fs.unlinkSync(localExe); } catch (e) { /* ignore */ } } }
+    function riCleanup(localExe) { if (localExe) { try { fs.unlinkSync(localExe); } catch (e) { return e.code === 'ENOENT'; } } return true; }
 
     // Reachability precheck: ICMP + WinRM bind with the stored push cred.
     function riReachabilityScript(blob, username, host) {
@@ -734,6 +737,7 @@ module.exports.remoraTerminalBridge = function (parent) {
     function riRunScript() {
         return [
             "$ErrorActionPreference='Stop'",
+            "$lifecycleResult=$null; $cleanup='unknown'",
             "try {",
             "  $job = [Console]::In.ReadLine() | ConvertFrom-Json",
             "  Add-Type -AssemblyName System.Security",
@@ -748,10 +752,14 @@ module.exports.remoraTerminalBridge = function (parent) {
             "    $rt = Invoke-Command -Session $s -ScriptBlock { Join-Path $env:TEMP ('ra-' + [guid]::NewGuid().ToString('N') + '.exe') }",
             "    try {",
             "      Copy-Item -ToSession $s -LiteralPath $job.localExe -Destination $rt -Force",
-            "      Invoke-Command -Session $s -ScriptBlock ([scriptblock]::Create($job.script)) -ArgumentList $job.mode,$job.operationId,$rt,$job.installerSha256",
-            "    } finally { if ($rt) { Invoke-Command -Session $s -ScriptBlock { param($p) Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue } -ArgumentList $rt -ErrorAction SilentlyContinue } }",
+            "      $lines=@(Invoke-Command -Session $s -ScriptBlock ([scriptblock]::Create($job.script)) -ArgumentList $job.mode,$job.operationId,$rt,$job.installerSha256)",
+            "      $lifecycleResult=$lines | Where-Object { $_ -match '^ri-result:[a-z_]+$' } | Select-Object -Last 1",
+            "      if (-not $lifecycleResult -or $lifecycleResult -eq 'ri-result:outcome_unknown') { $lifecycleResult=$null; throw 'lifecycle unconfirmed' }",
+            "      if ($lines -contains 'ri-cleanup:confirmed') { $cleanup='confirmed' }",
+            "    } finally { if ($rt) { try { $removed=Invoke-Command -Session $s -ScriptBlock { param($p) Remove-Item -LiteralPath $p -Force -ErrorAction Stop; if (Test-Path -LiteralPath $p) { throw 'cleanup unconfirmed' }; 'ri-temp:removed' } -ArgumentList $rt -ErrorAction Stop; if ($removed -ne 'ri-temp:removed') { $cleanup='unknown' } } catch { $cleanup='unknown' } } }",
             "  } finally { Remove-PSSession $s }",
-            "} catch { Write-Output 'ri-result:outcome_unknown'; exit 1 }"
+            "} catch { if ($lifecycleResult) { $cleanup='unknown' } else { Write-Output 'ri-result:outcome_unknown'; exit 1 } }",
+            "Write-Output $lifecycleResult; Write-Output ('ri-cleanup:' + $cleanup)"
         ].join("\n");
     }
 
@@ -900,7 +908,7 @@ module.exports.remoraTerminalBridge = function (parent) {
                 var file = riOperationPath(host), record = JSON.parse(fs.readFileSync(file, 'utf8'));
                 if (record.groupId !== groupId) return replyError(session, command, 'permission_denied');
                 if (record.state === 'running' && !riActive[file]) record.state = 'unknown';
-                reply(session, command, { state: record.state, outcome: record.outcome, mode: record.mode, operationId: record.operationId });
+                reply(session, command, { state: record.state, outcome: record.outcome, mode: record.mode, operationId: record.operationId, cleanup: record.cleanup });
             } catch (_) { replyError(session, command, 'operation_status_unavailable'); }
         });
     }
@@ -958,7 +966,7 @@ module.exports.remoraTerminalBridge = function (parent) {
                         fs.unlinkSync(operationFile + '.lock');
                         if (previous.groupId !== groupId || previous.mode !== mode || previous.actor !== actor) return replyError(session, command, 'invalid_input');
                         if (previous.state === 'failed') return replyError(session, command, previous.outcome);
-                        return reply(session, command, { ok: true, host: host, group: groupId, operationId: operationId, mode: mode, outcome: previous.outcome });
+                        return reply(session, command, { ok: true, host: host, group: groupId, operationId: operationId, mode: mode, outcome: previous.outcome, cleanup: previous.cleanup });
                     }
                 } catch (e) { if (e.code !== 'ENOENT') throw e; }
                 record = { operationId: operationId, actor: actor, groupId: groupId, mode: mode, state: 'running', outcome: null };
@@ -966,18 +974,19 @@ module.exports.remoraTerminalBridge = function (parent) {
                 riActive[operationFile] = true;
             } catch (_) { return replyError(session, command, 'target_busy_or_unknown'); }
 
-            function finish(outcome, error) {
+            function finish(outcome, error, cleanup) {
                 if (!riActive[operationFile]) return;
                 delete riActive[operationFile];
                 record.state = outcome === 'outcome_unknown' ? 'unknown' : (error ? 'failed' : 'completed');
                 record.outcome = outcome;
+                if (cleanup) record.cleanup = cleanup;
                 try {
                     riWriteOperation(operationFile, record);
                     if (record.state !== 'unknown') fs.unlinkSync(operationFile + '.lock');
                 } catch (_) { record.state = 'unknown'; error = true; outcome = 'outcome_unknown'; }
-                dispatchRiAudit(actor, { msg: 'Remote Install ' + mode + ': ' + outcome, actor: actor, host: host, group: groupId, operationId: operationId, mode: mode, status: record.state === 'unknown' ? 'unknown' : (error ? 'error' : 'success') });
+                dispatchRiAudit(actor, { msg: 'Remote Install ' + mode + ': ' + outcome, actor: actor, host: host, group: groupId, operationId: operationId, mode: mode, cleanup: record.cleanup, status: record.state === 'unknown' ? 'unknown' : (error ? 'error' : 'success') });
                 if (error) return replyError(session, command, outcome, { operationId: operationId });
-                reply(session, command, { ok: true, host: host, group: groupId, operationId: operationId, mode: mode, outcome: outcome });
+                reply(session, command, { ok: true, host: host, group: groupId, operationId: operationId, mode: mode, outcome: outcome, cleanup: record.cleanup });
             }
 
             dispatchRiAudit(actor, { msg: 'Remote Install ' + mode + ' started', actor: actor, host: host, group: groupId, mode: mode, operationId: operationId, status: 'started' });
@@ -1006,12 +1015,13 @@ module.exports.remoraTerminalBridge = function (parent) {
                 try { installerSha256 = crypto.createHash('sha256').update(fs.readFileSync(localExe)).digest('hex'); }
                 catch (_) { riCleanup(localExe); return finish('installer_gen_failed', true); }
                 function complete(err, res) {
-                    riCleanup(localExe);
+                    var serverClean = riCleanup(localExe);
                     var m = res && /ri-result:([a-z_]+)/.exec(res.stdout || '');
                     var outcome = !err && res && res.code === 0 && m ? m[1] : 'outcome_unknown';
                     var known = ['installer_completed', 'removed', 'agent_exists', 'agent_not_found', 'agent_binary_missing', 'agent_unverified', 'agent_ambiguous', 'admin_required', 'unsafe_target_state', 'target_busy_or_unknown', 'operation_already_seen', 'installer_missing', 'installer_unverified', 'removal_unconfirmed', 'install_failed'];
                     if (known.indexOf(outcome) < 0) outcome = 'outcome_unknown';
-                    finish(outcome, outcome !== 'installer_completed' && outcome !== 'removed');
+                    var cleanup = serverClean && res && /^ri-cleanup:confirmed\r?$/m.test(res.stdout || '') && !/^ri-cleanup:unknown\r?$/m.test(res.stdout || '') ? 'confirmed' : 'unknown';
+                    finish(outcome, outcome !== 'installer_completed' && outcome !== 'removed', cleanup);
                 }
                 if (process.platform === 'linux') return riLinuxRun(meta, host, mode, localExe, operationId, complete, installerSha256);
                 try { runPowerShell(riRunScript(), JSON.stringify({ blob: meta.blob, username: meta.username, host: host, localExe: localExe, mode: mode, operationId: operationId, installerSha256: installerSha256, script: fs.readFileSync(path.join(__dirname, 'remote-install', 'lifecycle.ps1'), 'utf8') }), complete, 180000); }

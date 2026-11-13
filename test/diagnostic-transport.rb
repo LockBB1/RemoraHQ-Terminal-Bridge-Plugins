@@ -39,7 +39,15 @@ Dir.mktmpdir('remora-diag-test-') do |dir|
         def shell(*)
           shell = Object.new
           def shell.run(command)
-            if command.include?("-Action 'create'")
+            if command.start_with?('Join-Path')
+              text = 'C:\\Windows\\Temp\\fixture.exe'
+            elsif command.start_with?('Remove-Item')
+              raise 'private lifecycle cleanup error' if ENV['RI_TEST_CASE'] == 'lifecycle_cleanup'
+              text = 'ri-temp:removed'
+            elsif command.include?("-Mode 'remove'")
+              raise 'private lifecycle error' if ENV['RI_TEST_CASE'] == 'lifecycle_missing'
+              text = "ri-result:removed\nri-cleanup:#{ENV['RI_TEST_CASE'] == 'lifecycle_target_cleanup' ? 'unknown' : 'confirmed'}"
+            elsif command.include?("-Action 'create'")
               text = 'ri-directory:C:\\ProgramData\\RemoraHQ-Diagnostic-' + ('a' * 32) + '\\installer.exe'
             elsif command.include?("-Action 'remove'")
               raise 'private cleanup error' if ENV['RI_TEST_CASE'] == 'cleanup'
@@ -47,9 +55,11 @@ Dir.mktmpdir('remora-diag-test-') do |dir|
             else
               text = 'ri-diagnostic:match:valid:present'
             end
-            Struct.new(:stdout, :exitcode).new(text, 0)
+            code = command.include?("-Mode 'remove'") && ENV['RI_TEST_CASE'] == 'lifecycle_nonzero' ? 1 : 0
+            Struct.new(:stdout, :exitcode).new(text, code)
           end
           yield shell
+          raise 'private shell close error' if ENV['RI_TEST_CASE'] == 'lifecycle_close'
         end
       end
     end
@@ -66,5 +76,16 @@ Dir.mktmpdir('remora-diag-test-') do |dir|
     stdout, stderr, status = Open3.capture3(env, RbConfig.ruby, File.join(dir, 'winrm.rb'), stdin_data: job)
     raise 'diagnostic transport result failed' unless status.exitstatus == code && stdout.lines.map(&:strip).include?(marker) && stderr.empty? && !stdout.include?('private')
   end
+  lifecycle_job = JSON.parse(job).merge('mode' => 'remove').to_json
+  { 'lifecycle_cleanup' => [0, "ri-result:removed\nri-cleanup:unknown"],
+    'lifecycle_ok' => [0, "ri-result:removed\nri-cleanup:confirmed"],
+    'lifecycle_target_cleanup' => [0, "ri-result:removed\nri-cleanup:unknown"],
+    'lifecycle_close' => [0, "ri-result:removed\nri-cleanup:unknown"],
+    'lifecycle_nonzero' => [1, 'ri-result:outcome_unknown'],
+    'lifecycle_missing' => [1, 'ri-result:outcome_unknown'] }.each do |mode, (code, marker)|
+    env = { 'RUBYOPT' => "-r#{shim_path.tr('\\', '/')}", 'RI_TEST_CASE' => mode }
+    stdout, stderr, status = Open3.capture3(env, RbConfig.ruby, File.join(dir, 'winrm.rb'), stdin_data: lifecycle_job)
+    raise "lifecycle transport result failed: #{mode} (exit=#{status.exitstatus})" unless status.exitstatus == code && stdout.strip == marker && stderr.empty?
+  end
 end
-puts 'Diagnostic upload and cleanup outcomes PASS'
+puts 'Diagnostic and lifecycle upload, cleanup and close outcomes PASS'

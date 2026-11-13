@@ -15,6 +15,8 @@ require 'gssapi/extensions'
 raise 'unsupported_winrm_version' unless Gem.loaded_specs.fetch('winrm').version.to_s == '2.4.1'
 require_relative 'gssapi-safety'
 
+lifecycle_marker = nil
+lifecycle_cleanup = 'unknown'
 begin
   job = JSON.parse(STDIN.read(2 * 1024 * 1024))
   username = job.fetch('username')
@@ -85,9 +87,18 @@ begin
           result = shell.run(script)
           # Only protocol markers leave the process; never forward remote output/errors.
           marker = result.exitcode == 0 ? result.stdout.lines.map(&:strip).grep(/\Ari-result:[a-z_]+\z/).last : nil
-          puts(marker || 'ri-result:outcome_unknown')
+          raise 'lifecycle unconfirmed' unless marker && marker != 'ri-result:outcome_unknown'
+          lifecycle_marker = marker
+          lifecycle_cleanup = 'confirmed' if result.stdout.lines.map(&:strip).include?('ri-cleanup:confirmed')
         ensure
-          shell.run("Remove-Item -LiteralPath '#{remote}' -Force -ErrorAction SilentlyContinue") if remote
+          begin
+            if remote
+              removed = shell.run("Remove-Item -LiteralPath '#{remote}' -Force -ErrorAction Stop; if (Test-Path -LiteralPath '#{remote}') { throw 'cleanup unconfirmed' }; 'ri-temp:removed'")
+              lifecycle_cleanup = 'unknown' unless removed.exitcode == 0 && removed.stdout.lines.map(&:strip).include?('ri-temp:removed')
+            end
+          rescue StandardError
+            lifecycle_cleanup = 'unknown'
+          end
         end
       end
     end
@@ -96,6 +107,14 @@ begin
   end
 rescue StandardError
   # Exceptions can contain credentials, SOAP, target paths or Kerberos diagnostics.
-  puts 'ri-result:outcome_unknown'
-  exit 1
+  if lifecycle_marker
+    lifecycle_cleanup = 'unknown'
+  else
+    puts 'ri-result:outcome_unknown'
+    exit 1
+  end
+end
+if lifecycle_marker
+  puts lifecycle_marker
+  puts 'ri-cleanup:' + lifecycle_cleanup
 end

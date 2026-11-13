@@ -9,6 +9,7 @@ $ProgressPreference = 'SilentlyContinue'
 $started = $false
 $locked = $false
 $result = 'outcome_unknown'
+$cleanup = 'unknown'
 $runDirectory = $null
 $root = Join-Path $env:ProgramData 'RemoraHQ-RemoteInstall'
 $lock = Join-Path $root 'active'
@@ -136,7 +137,13 @@ try {
     if (-not $started -and $allowed -contains $_.Exception.Message) { $result = $_.Exception.Message }
     # Once a destructive command starts, an exception is an unknown outcome.
 } finally {
-    if ($runDirectory -and -not $started) { Remove-Item -LiteralPath $runDirectory -Recurse -Force -ErrorAction SilentlyContinue }
-    if ($locked -and -not $started) { Remove-Item -LiteralPath $lock -Force -ErrorAction SilentlyContinue }
+    if (-not $started) {
+        try {
+            if ($runDirectory) { Remove-Item -LiteralPath $runDirectory -Recurse -Force -ErrorAction Stop }
+            if ($locked) { Remove-Item -LiteralPath $lock -Force -ErrorAction Stop }
+            $cleanup = 'confirmed'
+        } catch { $cleanup = 'unknown' }
+    }
 }
 Write-Output ('ri-result:' + $result)
+Write-Output ('ri-cleanup:' + $cleanup)
