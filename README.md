@@ -14,7 +14,7 @@ family.
 | Source repo folder | `RemoraHQ-Terminal-Bridge-Plugins` |
 | Deploy folder under Mesh | `meshcentral/plugins/remoraTerminalBridge` |
 
-## Terminal contract (Bridge 0.14.0)
+## Terminal contract (Bridge 0.14.1)
 
 The `open` action accepts `nodeId`, `shell` (`cmd`, `powershell`, `bash`,
 `zsh`) and the optional `context: "user"`. It returns a session identifier,
@@ -34,7 +34,7 @@ agent behavior are separate and unchanged; this does not close that route.
 Deployments need matching plugin and SPA versions. The `.setup` snapshot is not
 updated by edits to this checkout.
 
-## Remote Install 0.14.0
+## Remote Install 0.14.1
 
 Цели — Windows x64 с Windows PowerShell 5.1 и WinRM. Сервер — Windows
 (сохранённый DPAPI LocalMachine/Negotiate путь) либо Debian (Ruby WinRM,
@@ -60,8 +60,8 @@ Group типа 2. По решению владельца эта привилег
 | `remoteInstall.run.mode` | Поведение |
 | --- | --- |
 | `install` (также default для прежнего API) | Проверка дубликата по DB fail-closed и независимая проверка служб на самом ПК; найденный агент блокирует установку. |
-| `reinstall` | Ровно одна проверенная установка: `-fulluninstall` с явным `--meshServiceName`, подтверждение удаления службы и её Diagnostic-службы, затем новый installer выбранной группы. |
-| `remove` | То же проверенное удаление без последующего запуска installer. Копия нового installer используется только как эталон подписи. |
+| `reinstall` | Свежий installer текущего сервера выполняет `-fulluninstall` с явным `--meshServiceName`; после подтверждения удаления службы, Diagnostic-службы и старых EXE/MSH он устанавливает агент выбранной группы. |
+| `remove` | Тот же свежий installer удаляет найденную установку без последующей установки. Установленный на ПК EXE не запускается. |
 
 `-uninstall` и `-fulluninstall` не взаимозаменяемы: первый удаляет службу,
 второй также очищает установленный агент. Используется второй; его exit 0
@@ -69,20 +69,38 @@ Group типа 2. По решению владельца эта привилег
 MeshAgent и должен быть принят на тестовом ПК. При timeout/ошибке удаления
 новая установка не запускается.
 
-Переданный installer сверяется на ПК с SHA-256 серверного файла, включая
-штатные unsigned сборки в Install. Удаление дополнительно допускает только
-локальный EXE без reparse points, распознанное штатное имя службы либо `.msh` с
-MeshID/ServerID и действительную Authenticode-подпись **тем же сертификатом**,
-что installer текущего сервера. Это сознательная узкая граница: ротация
-сертификата, неподписанный или повреждённый EXE, отсутствующий файл,
-неоднозначные службы требуют ручной диагностики. Никакой перебор удаления
-всех установок или исполнение произвольного registry uninstall command не
-выполняется. Штатной службе не требуется обязательный sidecar `.msh`:
-policy может быть embedded. После завершения uninstaller скрипт ждёт 12 s
+Переданный installer сверяется на ПК с SHA-256 серверного файла для всех
+трёх действий. Перед запуском он копируется в отдельную папку операции внутри
+защищённого SYSTEM/Administrators каталога и повторно сверяется с SHA-256;
+рядом с ним нет policy/DB прежней установки. Доверенный Windows корень и
+совпадение сертификатов старого и нового агента не требуются: исполняется
+только свежий installer сервера, а не установленный EXE.
+
+Перед удалением проверяются основная и найденная Diagnostic-служба: локальные
+канонические пути без reparse points, shell expansion и неоднозначного разбора
+ImagePath, безопасные имена файлов и одна выделенная папка. Системные каталоги
+и корни диска/Program Files/ProgramData запрещены. Установка распознаётся по
+`.msh` с MeshID/ServerID либо штатному имени службы и имени `MeshAgent.exe`;
+в последнем случае policy может быть embedded. Кастомный EXE без `.msh`,
+Diagnostic в другой папке, отсутствующие файлы и неоднозначные службы требуют
+ручной диагностики. Никакой перебор удаления всех установок или исполнение
+произвольного registry uninstall command не выполняется.
+
+В upstream [agent-installer.js](https://github.com/Ylianst/MeshAgent/blob/0e6b4f7fea6c88ad1978206550d202a7f33741c5/modules/agent-installer.js)
+`fullUninstall` выбирает службу через `meshServiceName`, а
+[service-manager.js](https://github.com/Ylianst/MeshAgent/blob/0e6b4f7fea6c88ad1978206550d202a7f33741c5/modules/service-manager.js)
+берёт удаляемый EXE из её ImagePath; файл прежнего агента не исполняется.
+Upstream cleanup может удалять файлы с тем же базовым именем и пустые папки,
+поэтому preflight проверяет и связанные файлы. После завершения uninstaller скрипт ждёт 12 s
 (известный upstream detached self-delete использует 10 s), затем до 20 s
 проверяет отсутствие старых EXE/MSH и служб. Сохранившиеся файлы блокируют
 fresh install; самостоятельно они не удаляются. Эти задержки и соответствие
-конкретному старому binary требуют server smoke. При отсутствии службы Reinstall/Remove возвращают
+конкретной сборке свежего installer требуют server smoke. Upstream устанавливает
+`MeshAgent` независимо от имени переданной копии, а embedded MSH читает из EXE;
+это подтверждение по исходникам, запуск реального бинарника из защищённой папки
+и его подключение должны быть проверены владельцем. При неизвестном исходе
+защищённая копия installer и target lock сохраняются для ручной проверки.
+При отсутствии службы Reinstall/Remove возвращают
 `agent_not_found`; автоматического перехода к Install нет. Кастомные установки,
 которые невозможно распознать по службе или `.msh`, также требуют отдельной
 проверки перед использованием. Для Install не поддерживаются произвольные

@@ -1,7 +1,7 @@
 {
   "name": "RemoraHQ - Terminal Bridge",
   "shortName": "remoraTerminalBridge",
-  "version": "0.14.0",
+  "version": "0.14.1",
   "description": "Server-side bridge for RemoraHQ Terminal sessions. Issues User terminal sessions and rejects retired privileged modes. Native MeshCentral relay remains a separate path.",
   "hasAdminPanel": false,
   "homepage": "https://github.com/lockbb1/RemoraHQ-Terminal-Bridge-Plugins",
