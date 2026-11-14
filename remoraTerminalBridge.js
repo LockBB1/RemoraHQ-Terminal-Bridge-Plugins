@@ -653,6 +653,67 @@ module.exports.remoraTerminalBridge = function (parent) {
         });
     }
 
+    // Native removedevices authorizes with GetNodeWithRights + UNINSTALL (32768).
+    function riRecordNode(user, host, nodeId, cb) {
+        var ws = obj.meshServer && obj.meshServer.webserver;
+        var domainId = user._id.split('/')[1] || '';
+        if (typeof nodeId !== 'string' || nodeId.split('/').length !== 3 || nodeId.split('/')[0] !== 'node' || nodeId.split('/')[1] !== domainId || !ws || typeof ws.GetNodeWithRights !== 'function') return cb(null);
+        var domain = (obj.meshServer.config && obj.meshServer.config.domains && obj.meshServer.config.domains[domainId]) || { id: domainId };
+        ws.GetNodeWithRights(domain, user, nodeId, function (node, rights, visible) {
+            if (!node || node.type !== 'node' || node._id !== nodeId || !visible || (rights & 32768) === 0 || !ws.meshes || !ws.meshes[node.meshid] || ws.meshes[node.meshid].mtype !== 2 || !riTargetMatchesNode(host, node)) return cb(null);
+            cb(node);
+        });
+    }
+
+    function riRecordCandidates(user, host, cb) {
+        var db = obj.meshServer && obj.meshServer.db;
+        var ws = obj.meshServer && obj.meshServer.webserver;
+        if (!db || typeof db.GetAllType !== 'function' || !ws || typeof ws.GetNodeWithRights !== 'function' || obj.meshServer.multiServer) return cb(null);
+        db.GetAllType('node', function (err, nodes) {
+            if (err || !Array.isArray(nodes)) return cb(null);
+            var matches = nodes.filter(function (node) { return node && riTargetMatchesNode(host, node); });
+            // Bound synchronous native callbacks; larger inventories require manual record cleanup.
+            if (matches.length > 100) return cb(null);
+            var result = [], i = 0;
+            function next() {
+                if (i >= matches.length) return cb(result);
+                riRecordNode(user, host, matches[i++]._id, function (node) {
+                    if (node) {
+                        var ws = obj.meshServer.webserver;
+                        result.push({ nodeId: node._id, name: node.name || '', host: node.host || node.rname || node.ip || '', groupName: ws.meshes && ws.meshes[node.meshid] ? ws.meshes[node.meshid].name : '' });
+                    }
+                    next();
+                });
+            }
+            next();
+        });
+    }
+
+    function riRecordSelection(node) {
+        return { nodeId: node._id, meshId: node.meshid, name: node.name || '', host: node.host || '', rname: node.rname || '' };
+    }
+
+    function riRecordStatus(user, host, record, cb) {
+        if (!record.recordSelection || record.actor !== user._id || record.mode !== 'remove' || record.state !== 'completed' || record.outcome !== 'removed') return cb(undefined);
+        var selection = record.recordSelection;
+        var blocked = { nodeId: selection.nodeId, name: selection.name, state: 'blocked' };
+        var db = obj.meshServer && obj.meshServer.db;
+        if (!db || typeof db.Get !== 'function' || obj.meshServer.multiServer) return cb(blocked);
+        db.Get(selection.nodeId, function (err, nodes) {
+        if (err || !Array.isArray(nodes)) return cb(blocked);
+        if (nodes.length === 0) return cb({ nodeId: selection.nodeId, name: selection.name, state: 'absent' });
+        riRecordNode(user, host, record.recordSelection.nodeId, function (node) {
+            if (!node) return cb(blocked);
+            var unchanged = JSON.stringify(riRecordSelection(node)) === JSON.stringify(record.recordSelection);
+            var ws = obj.meshServer.webserver;
+            var server = obj.meshServer;
+            var connectivity = typeof server.GetConnectivityState === 'function' ? server.GetConnectivityState(node._id) : null;
+            var connected = server.multiServer || typeof server.GetConnectivityState !== 'function' || !ws.wsagents || ws.wsagents[node._id] || (connectivity && (connectivity.connectivity & 1));
+            cb({ nodeId: node._id, name: node.name || '', state: unchanged && !connected ? 'ready' : 'blocked' });
+        });
+        });
+    }
+
     // Build the .msh policy + stream the per-group agent into a temp file.
     // Mirrors webserver.js handleAgentRequest (the native /meshagents path) for
     // the connectivity-critical fields. Optional domain agentcustomization
@@ -825,14 +886,16 @@ module.exports.remoraTerminalBridge = function (parent) {
                 // already registered for this host before they spend a TOTP. A
                 // scan error here is non-fatal (the run path hard-blocks anyway).
                 riFindExistingNode(user, host, function (scanErr, match) {
-                    reply(session, command, {
+                    riRecordCandidates(user, host, function (candidates) { reply(session, command, {
                         lifecycleVersion: 1,
                         pingChecked: process.platform !== 'linux',
                         reachable: ping, winrm: winrm,
                         existing: !!(match && !scanErr),
                         existingVisible: match ? match.visible : undefined,
-                        existingGroup: (match && match.groupName) || undefined
-                    });
+                        existingGroup: (match && match.groupName) || undefined,
+                        recordRemovalVersion: candidates ? 1 : undefined,
+                        recordCandidates: candidates || undefined
+                    }); });
                 });
             }
             if (process.platform === 'linux') return riLinuxRun(meta, host, 'probe', null, null, complete);
@@ -908,7 +971,9 @@ module.exports.remoraTerminalBridge = function (parent) {
                 var file = riOperationPath(host), record = JSON.parse(fs.readFileSync(file, 'utf8'));
                 if (record.groupId !== groupId) return replyError(session, command, 'permission_denied');
                 if (record.state === 'running' && !riActive[file]) record.state = 'unknown';
-                reply(session, command, { state: record.state, outcome: record.outcome, mode: record.mode, operationId: record.operationId, cleanup: record.cleanup });
+                riRecordStatus(user, host, record, function (recordRemoval) {
+                    reply(session, command, { state: record.state, outcome: record.outcome, mode: record.mode, operationId: record.operationId, cleanup: record.cleanup, recordRemoval: recordRemoval });
+                });
             } catch (_) { replyError(session, command, 'operation_status_unavailable'); }
         });
     }
@@ -931,6 +996,7 @@ module.exports.remoraTerminalBridge = function (parent) {
             if (!RI_GROUP_RE.test(groupId)) return replyError(session, command, 'invalid_group');
             if (!Number.isInteger(installFlags) || installFlags < 0 || installFlags > 3) return replyError(session, command, 'invalid_input');
             if (mode !== 'install' && command.confirmedHost !== host) return replyError(session, command, 'confirmation_required');
+            if (command.removeNodeId != null && mode !== 'remove') return replyError(session, command, 'invalid_input');
 
             // Per-mesh authz: caller must hold install rights on the target group
             // (cross-mesh priv-esc guard — the "visible groups only" rule was
@@ -953,6 +1019,16 @@ module.exports.remoraTerminalBridge = function (parent) {
 
             if (process.platform !== 'win32' && process.platform !== 'linux') return replyError(session, command, 'unsupported_platform');
             if (process.platform === 'linux' && (!host.includes('.') || /^[\d.]+$/.test(host))) return replyError(session, command, 'kerberos_fqdn_required');
+            var selection;
+            if (command.removeNodeId != null) {
+                return riRecordNode(user, host, command.removeNodeId, function (node) {
+                    if (!node) return replyError(session, command, 'record_removal_denied');
+                    selection = riRecordSelection(node);
+                    start();
+                });
+            }
+            start();
+            function start() {
             var operationId = command.operationId == null ? crypto.randomBytes(16).toString('hex') : command.operationId, operationFile, record;
             if (typeof operationId !== 'string' || !/^[a-f0-9]{32}$/.test(operationId)) return replyError(session, command, 'invalid_input');
             try {
@@ -964,12 +1040,13 @@ module.exports.remoraTerminalBridge = function (parent) {
                     if (previous.state === 'running' || previous.state === 'unknown') return replyError(session, command, 'target_busy_or_unknown');
                     if (previous.operationId === operationId) {
                         fs.unlinkSync(operationFile + '.lock');
-                        if (previous.groupId !== groupId || previous.mode !== mode || previous.actor !== actor) return replyError(session, command, 'invalid_input');
+                        if (previous.groupId !== groupId || previous.mode !== mode || previous.actor !== actor || (previous.recordSelection && previous.recordSelection.nodeId) !== (selection && selection.nodeId)) return replyError(session, command, 'invalid_input');
                         if (previous.state === 'failed') return replyError(session, command, previous.outcome);
                         return reply(session, command, { ok: true, host: host, group: groupId, operationId: operationId, mode: mode, outcome: previous.outcome, cleanup: previous.cleanup });
                     }
                 } catch (e) { if (e.code !== 'ENOENT') throw e; }
                 record = { operationId: operationId, actor: actor, groupId: groupId, mode: mode, state: 'running', outcome: null };
+                if (selection) record.recordSelection = selection;
                 riWriteOperation(operationFile, record);
                 riActive[operationFile] = true;
             } catch (_) { return replyError(session, command, 'target_busy_or_unknown'); }
@@ -1029,6 +1106,7 @@ module.exports.remoraTerminalBridge = function (parent) {
             }
             riGenerateInstaller(groupId, installFlags, generated);
             } // proceedInstall
+            } // start
         });
     }
 

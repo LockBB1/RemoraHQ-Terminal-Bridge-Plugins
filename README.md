@@ -14,7 +14,7 @@ family.
 | Source repo folder | `RemoraHQ-Terminal-Bridge-Plugins` |
 | Deploy folder under Mesh | `meshcentral/plugins/remoraTerminalBridge` |
 
-## Terminal contract (Bridge 0.14.3)
+## Terminal contract (Bridge 0.15.0)
 
 The `open` action accepts `nodeId`, `shell` (`cmd`, `powershell`, `bash`,
 `zsh`) and the optional `context: "user"`. It returns a session identifier,
@@ -34,7 +34,7 @@ agent behavior are separate and unchanged; this does not close that route.
 Deployments need matching plugin and SPA versions. The `.setup` snapshot is not
 updated by edits to this checkout.
 
-## Remote Install 0.14.3
+## Remote Install 0.15.0
 
 Цели — Windows x64 с Windows PowerShell 5.1 и WinRM. Сервер — Windows
 (сохранённый DPAPI LocalMachine/Negotiate путь) либо Debian (Ruby WinRM,
@@ -55,7 +55,46 @@ Group типа 2. По решению владельца эта привилег
 доступный push account Windows-ПК, включая агент старого сервера; выбранная
 группа не является доказательством принадлежности ПК. Выдавайте её только
 операторам, которым разрешён такой охват. Push Account остаётся super-admin-only.
-Действия не требуют TOTP и не удаляют записи ни с текущего, ни со старого сервера.
+Действия не требуют TOTP. Install/Reinstall сохраняют серверные записи.
+Remove может дополнительно удалить выбранную запись текущего сервера через
+штатный SPA `agent.delete` / MeshCentral `removedevices` после подтверждённого
+удаления агента. Записи старого сервера автоматически не изменяются.
+
+На standalone сервере Check возвращает `recordRemovalVersion: 1` и `recordCandidates` только для
+совпадающих по имени/host/IP узлов текущего domain, видимых оператору с native
+`MESHRIGHT_UNINSTALL` (32768). Единственный кандидат показан заранее; при
+нескольких требуется выбор точного nodeId либо явное сохранение записей.
+Сопоставление имени — подсказка, а не доказательство физической идентичности ПК.
+Показаны доступные host/FQDN, имя, группа и nodeId, чтобы оператор мог различить
+записи. UI предупреждает, что штатный каскад удаляет также заметки и часть истории.
+Отсутствие прав на запись не препятствует разрешённому удалению агента через WinRM:
+в этом случае запись сохраняется и UI сообщает об этом заранее.
+
+Необязательный `removeNodeId` разрешён только для mode `remove`. Bridge до
+запуска проверяет native права, domain и соответствие выбранной записи host;
+сохраняет точный nodeId и снимок её имени/группы/host в intent. После
+`completed` + `removed` status возвращает `recordRemoval {nodeId,name,state}`
+только исходному actor. `ready` требует повторной проверки прав, неизменной
+записи и отсутствия подключения по wsagents и GetConnectivityState; иначе `blocked`.
+SPA перепроверяет operationId и status непосредственно перед штатным delete,
+который снова проверяет native права. Каскад удаления в плагине не дублируется.
+Native ACK должен явно подтвердить успех; затем status читает точный nodeId из
+DB и подтверждает пустой результат как `absent`. Ошибка чтения и отсутствие
+прав дают `blocked`, а не отсутствие. Ошибка и timeout не считаются удалением.
+
+Результаты удаления службы и карточки показаны отдельно. Если вкладка закрыта
+или ответ delete потерян, карточка может остаться. Refresh outcome для того же
+host/group восстанавливает выбранный nodeId без нового Remove; отдельная
+кнопка удаления записи повторно проверяет права/status. Автоматического повтора
+нет. Подтверждённо отсутствующая запись не удаляется повторно; изменённая,
+недоступная или снова подключённая запись блокирует шаг — проверьте Agents
+вручную. Status относится к последнему intent на host:
+последующий run заменяет возможность такого восстановления. Проверка offline
+и native delete не атомарны, поэтому повторную установку на этом ПК до завершения
+обоих шагов не запускайте. В multiserver режиме выбор карточки недоступен,
+а status блокирует её удаление: cluster-wide атомарный guard не реализован.
+При discovery более 100 совпадений/недоступном native API удаление записи не
+предлагается; базовые операции доступны по прежнему контракту.
 
 | `remoteInstall.run.mode` | Поведение |
 | --- | --- |

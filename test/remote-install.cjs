@@ -63,13 +63,17 @@ function fixture(options = {}) {
     vm.runInNewContext(source, { module, require: fakeRequire, Buffer, process: { platform: options.linux ? 'linux' : 'win32', env: {}, kill(pid) { killed.push(pid); } }, __dirname: path.join(__dirname, '..'), setTimeout: (fn, ms) => { if (options.timeout && ms === 180000) { queueMicrotask(fn); return null; } return setTimeout(fn, ms); }, clearTimeout, console: { log() {} } });
     const flags = options.flags ?? { canRemoteInstall: true };
     const meshServer = {
+        multiServer: options.cluster ? {} : null,
+        GetConnectivityState(id) { return options.connected && options.connected[id] ? { connectivity: 1 } : null; },
         datapath: path.join(path.parse(process.cwd()).root, 'fictional-fixture'),
         db: {
-            Get(_id, cb) { cb(options.policyError ? new Error('Policy unavailable') : null, [{ grants: { [actor]: flags } }]); },
+            Get(_id, cb) { if (_id.startsWith('node/')) return cb(options.nodeReadError ? new Error('Read unavailable') : null, (options.nodes || []).filter(node => node._id === _id)); cb(options.policyError ? new Error('Policy unavailable') : null, [{ grants: { [actor]: flags } }]); },
             GetAllType(_type, cb) { cb(options.scanError ? new Error('Scan unavailable') : null, options.nodes ?? []); },
         },
         webserver: {
             meshes: { [groupId]: { name: 'Fixture group', mtype: 2 }, 'mesh//hidden': { name: 'Hidden fixture group' } },
+            wsagents: options.connected || {},
+            GetNodeWithRights(_domain, _user, id, cb) { const node = (options.nodes || []).find(node => node._id === id); cb(node, options.nodeRights ?? 32768, options.nodeVisible !== false); },
             GetMeshRights(_user, id) { return id === groupId ? (options.rights ?? 1) : 0; },
             agentCertificateHashHex: 'aabbcc', getWebServerName: () => 'example.invalid',
         },
@@ -214,6 +218,63 @@ test('an unknown outcome persists, blocks another run and can be read without an
     assert.equal(state.state, 'unknown'); assert.equal(state.operationId, first.operationId);
     assert.equal(f.spawns.length, 1); assert.equal(f.audits.at(-1).status, 'unknown');
     assert.equal((await f.request({ pluginaction: 'remoteInstall.status', groupId: 'mesh//hidden' })).error, 'permission_denied');
+});
+
+test('record discovery returns all authorized same-domain matches without hidden nodes', async () => {
+    const nodes = ['one', 'two'].map(id => ({ type: 'node', _id: 'node//' + id, name: 'host', meshid: groupId }));
+    nodes.push({ type: 'node', _id: 'node/foreign/other', name: 'host', meshid: groupId });
+    const f = fixture({ nodes });
+    const result = await f.request({ pluginaction: 'remoteInstall.reachability' });
+    assert.equal(result.recordRemovalVersion, 1);
+    assert.deepEqual(result.recordCandidates.map(node => node.nodeId), ['node//one', 'node//two']);
+    for (const denied of [{ nodeRights: 1 }, { nodeVisible: false }]) {
+        const limited = fixture({ nodes, ...denied });
+        assert.deepEqual((await limited.request({ pluginaction: 'remoteInstall.reachability' })).recordCandidates, []);
+        assert.equal((await limited.request({ mode: 'remove', confirmedHost: 'host.example.invalid' })).ok, true);
+    }
+});
+
+test('selected record requires exact identity, host match and native uninstall rights before Remove', async () => {
+    const node = { type: 'node', _id: 'node//one', name: 'host', meshid: groupId };
+    for (const overrides of [{ nodeRights: 1 }, { nodeVisible: false }, { nodes: [{ ...node, name: 'other' }] }, { nodes: [] }]) {
+        const f = fixture({ nodes: [node], ...overrides });
+        assert.equal((await f.request({ mode: 'remove', confirmedHost: 'host.example.invalid', removeNodeId: node._id })).error, 'record_removal_denied');
+        assert.equal(f.spawns.length, 0);
+    }
+    const f = fixture({ nodes: [node] });
+    assert.equal((await f.request({ mode: 'reinstall', confirmedHost: 'host.example.invalid', removeNodeId: node._id })).error, 'invalid_input');
+});
+
+test('only confirmed Remove offers the original actor an unchanged offline selected record', async () => {
+    const node = { type: 'node', _id: 'node//one', name: 'host', meshid: groupId };
+    for (const outcome of ['removed', 'installer_completed', 'outcome_unknown', 'removal_unconfirmed']) {
+        const options = { nodes: [{ ...node }], outcome };
+        const f = fixture(options);
+        const result = await f.request({ mode: 'remove', confirmedHost: 'host.example.invalid', removeNodeId: node._id });
+        const state = await f.request({ pluginaction: 'remoteInstall.status' });
+        if (outcome !== 'removed') { assert.equal(state.recordRemoval, undefined); continue; }
+        assert.equal(result.outcome, 'removed');
+        assert.deepEqual(state.recordRemoval, { nodeId: node._id, name: 'host', state: 'ready' });
+        options.nodeRights = 1;
+        assert.equal((await f.request({ pluginaction: 'remoteInstall.status' })).recordRemoval.state, 'blocked');
+        options.nodeRights = 32768; options.nodes[0].meshid = 'mesh//changed';
+        assert.equal((await f.request({ pluginaction: 'remoteInstall.status' })).recordRemoval.state, 'blocked');
+        options.nodes[0].meshid = groupId;
+        options.nodeReadError = true;
+        assert.equal((await f.request({ pluginaction: 'remoteInstall.status' })).recordRemoval.state, 'blocked');
+        options.nodeReadError = false;
+        assert.equal((await f.request({ pluginaction: 'remoteInstall.status' }, { _id: 'user//other', siteadmin: 0xFFFFFFFF })).recordRemoval, undefined);
+        options.nodes.length = 0;
+        assert.equal((await f.request({ pluginaction: 'remoteInstall.status' })).recordRemoval.state, 'absent');
+        assert.equal(f.spawns.length, 1);
+    }
+    const connected = fixture({ nodes: [node], outcome: 'removed', connected: { [node._id]: {} } });
+    await connected.request({ mode: 'remove', confirmedHost: 'host.example.invalid', removeNodeId: node._id });
+    assert.equal((await connected.request({ pluginaction: 'remoteInstall.status' })).recordRemoval.state, 'blocked');
+    const cluster = fixture({ nodes: [node], outcome: 'removed', cluster: true });
+    assert.equal((await cluster.request({ pluginaction: 'remoteInstall.reachability' })).recordRemovalVersion, undefined);
+    await cluster.request({ mode: 'remove', confirmedHost: 'host.example.invalid', removeNodeId: node._id });
+    assert.equal((await cluster.request({ pluginaction: 'remoteInstall.status' })).recordRemoval.state, 'blocked');
 });
 
 test('confirmed removal and uncertain cleanup remain distinct in replies, replay, status and audit', async () => {
