@@ -10,22 +10,25 @@ const actor = 'user//fixture', groupId = 'mesh//QUJD';
 
 // All external effects stay in memory; no subprocess, filesystem write, DB or network is used.
 function fixture(options = {}) {
-    const audits = [], spawns = [], installers = [], removed = [], files = new Map(), scratchRemoved = [], killed = [];
+    const audits = [], spawns = [], installers = [], removed = [], files = new Map(options.files || []), scratchRemoved = [], killed = [];
     const secret = Buffer.from('synthetic password');
     let reads = 0;
     const user = { _id: actor, siteadmin: 0, domain: '' };
     const metadata = options.metadata === undefined ? { blob: 'Zml4dHVyZQ==', username: 'EXAMPLE\\fixture' } : options.metadata;
     const fakeFs = {
         readFileSync(file) {
+            if (file.endsWith('remora-remoteinstall-settings.json')) { if (files.has(file)) return files.get(file); if (options.settings) return JSON.stringify(options.settings); throw Object.assign(new Error('Not found'), { code: 'ENOENT' }); }
             if (file.endsWith('lifecycle.ps1')) return fs.readFileSync(file, 'utf8');
             if (file.includes('remora-ri-operations')) { if (!files.has(file)) throw Object.assign(new Error('Not found'), { code: 'ENOENT' }); return files.get(file); }
             reads++; if (!metadata) throw new Error('Not configured'); return JSON.stringify(metadata);
         },
         writeFileSync(file, content, writeOptions) {
             if (file.endsWith('remora-remoteinstall.json') && options.encodingProbe) { files.set(file, content); return; }
+            if (file.includes('remora-remoteinstall-settings.json')) { if (writeOptions.flag === 'wx' && files.has(file)) throw new Error('Exists'); files.set(file, content); return; }
             if (!file.includes('remora-ri-operations')) throw new Error('Unexpected credential write');
             if (writeOptions.flag === 'wx' && files.has(file)) throw new Error('Exists'); files.set(file, content);
         },
+        readdirSync(directory) { return [...files.keys()].filter(file => path.dirname(file) === directory).map(file => path.basename(file)); },
         mkdirSync() {}, createWriteStream() { return new EventEmitter(); },
         mkdtempSync(prefix) { return prefix + 'fixture'; }, chmodSync() {},
         rmSync(file) { if (options.scratchCleanupFailure) throw new Error('private cleanup failure'); scratchRemoved.push(file); },
@@ -178,7 +181,7 @@ test('installer and remote failures retain failure audit and cleanup', async () 
 });
 test('install permission does not grant Push Account administration', async () => {
     const f = fixture();
-    for (const action of ['setAccount', 'testAccount', 'accountStatus']) assert.equal((await f.request({ pluginaction: 'remoteInstall.' + action })).error, 'forbidden');
+    for (const action of ['setAccount', 'testAccount', 'accountStatus', 'setSettings']) assert.equal((await f.request({ pluginaction: 'remoteInstall.' + action })).error, 'forbidden');
     assert.equal(f.reads(), 0); assert.equal(f.spawns.length, 0);
 });
 test('retired terminal modes are disabled independently of Remote Install', async () => {
@@ -360,4 +363,92 @@ test('Windows PowerShell preserves Unicode stdin through the real launcher witho
     assert.ok(credential);
     assert.equal(Buffer.from(JSON.parse(credential[1]).blob, 'base64').toString('utf8'), synthetic);
     assert.equal(f.spawns.length, 1);
+});
+
+
+test('DNS settings persist independently of credentials, enforce super-admin and validate domains', async () => {
+    const f = fixture(), admin = { _id: actor, siteadmin: 0xFFFFFFFF };
+    assert.equal((await f.request({ pluginaction: 'remoteInstall.setSettings', defaultDomain: 'example.invalid' })).error, 'forbidden');
+    for (const value of ['https://example.invalid', '.example.invalid', 'a..invalid', '-bad.invalid', 'bad-.invalid', '1.2.3.4', 'x'.repeat(64) + '.invalid', null]) {
+        assert.equal((await f.request({ pluginaction: 'remoteInstall.setSettings', defaultDomain: value }, admin)).error, 'invalid_domain');
+    }
+    assert.equal((await f.request({ pluginaction: 'remoteInstall.setSettings', defaultDomain: 'EXAMPLE.INVALID' }, admin)).defaultDomain, 'example.invalid');
+    const status = await f.request({ pluginaction: 'remoteInstall.accountStatus' }, admin);
+    assert.equal(status.defaultDomain, 'example.invalid');
+    assert.equal(status.configured, true);
+    assert.equal(status.username, 'EXAMPLE\\fixture');
+    assert.equal(f.spawns.length, 0);
+    assert.equal([...f.files.keys()].some(file => file.endsWith('remora-remoteinstall.json')), false);
+    assert.equal((await f.request({ pluginaction: 'remoteInstall.setSettings', defaultDomain: '' }, admin)).defaultDomain, '');
+});
+
+test('short names, FQDNs and IPs use one target resolution for probe, lifecycle, lookup and status', async () => {
+    for (const linux of [false, true]) {
+        const f = fixture({ linux, settings: { defaultDomain: 'example.invalid' }, outcome: 'removed', nodes: [{ type: 'node', _id: 'node//one', meshid: groupId, name: 'host' }] });
+        await f.request({ pluginaction: 'remoteInstall.reachability', host: 'host' });
+        const probe = f.spawns.at(-1);
+        if (linux) assert.equal(probe.stdin.host, 'host.example.invalid');
+        else assert.match(Buffer.from(probe.args.at(-1), 'base64').toString('utf16le'), /ComputerName 'host.example.invalid'/);
+        const result = await f.request({ host: 'HOST', mode: 'remove', confirmedHost: 'HOST', removeNodeId: 'node//one', operationId: 'd'.repeat(32) });
+        assert.equal(result.host, 'host.example.invalid');
+        assert.equal(f.spawns.at(-1).stdin.host, 'host.example.invalid');
+        assert.equal((await f.request({ pluginaction: 'remoteInstall.status', host: 'host.example.invalid' })).recordRemoval.state, 'ready');
+        assert.equal((await f.request({ pluginaction: 'remoteInstall.status', host: 'host' })).operationId, result.operationId);
+        assert.equal((await f.request({ host: 'host.other.invalid', mode: 'remove', confirmedHost: 'host.other.invalid' })).host, 'host.other.invalid');
+        if (linux) assert.equal((await f.request({ host: '192.0.2.1' })).error, 'kerberos_fqdn_required');
+        else assert.equal((await f.request({ host: '192.0.2.1', mode: 'remove', confirmedHost: '192.0.2.1' })).host, '192.0.2.1');
+    }
+});
+
+test('DNS changes and short or full-name aliases cannot bypass running or unknown operations', async () => {
+    const admin = { _id: actor, siteadmin: 0xFFFFFFFF };
+    for (const defaultDomain of ['', 'example.invalid']) {
+        const f = fixture({ hold: true, settings: { defaultDomain } });
+        const pending = f.request({ host: 'host' });
+        assert.equal((await f.request({ host: 'host.example.invalid' })).error, 'target_busy_or_unknown');
+        assert.equal((await f.request({ pluginaction: 'remoteInstall.setSettings', defaultDomain: defaultDomain ? '' : 'example.invalid' }, admin)).error, 'settings_busy');
+        f.spawns[0].child.release('outcome_unknown');
+        assert.equal((await pending).error, 'outcome_unknown');
+        assert.equal((await f.request({ host: 'host.example.invalid' })).error, 'target_busy_or_unknown');
+        assert.equal((await f.request({ pluginaction: 'remoteInstall.setSettings', defaultDomain: 'other.invalid' }, admin)).error, 'settings_busy');
+        assert.equal(f.spawns.length, 1);
+    }
+});
+
+
+test('legacy unknown aliases remain blocked and old completed records remain recoverable', async () => {
+    const directory = path.join(path.parse(process.cwd()).root, 'fictional-fixture', 'remora-ri-operations');
+    const operationFile = host => path.join(directory, require('node:crypto').createHash('sha256').update(host).digest('hex') + '.json');
+    const record = { operationId: 'e'.repeat(32), actor, groupId, mode: 'remove', outcome: 'outcome_unknown', state: 'unknown' };
+    const oldShort = fixture({ settings: { defaultDomain: 'example.invalid' }, files: [[operationFile('host'), JSON.stringify(record)]] });
+    assert.equal((await oldShort.request({ host: 'host.example.invalid' })).error, 'target_busy_or_unknown');
+    assert.equal((await oldShort.request({ pluginaction: 'remoteInstall.status', host: 'host.example.invalid' })).operationId, record.operationId);
+    const oldFull = fixture({ files: [[operationFile('host.example.invalid'), JSON.stringify(record)]] });
+    assert.equal((await oldFull.request({ host: 'host' })).error, 'legacy_target_unresolved');
+    assert.equal((await oldFull.request({ pluginaction: 'remoteInstall.status', host: 'host.example.invalid' })).state, 'unknown');
+    assert.equal((await oldFull.request({ host: 'other.example.invalid' })).ok, true);
+    const completed = fixture({ settings: { defaultDomain: 'example.invalid' }, files: [[operationFile('host'), JSON.stringify({ ...record, state: 'completed', outcome: 'removed' })]] });
+    assert.equal((await completed.request({ pluginaction: 'remoteInstall.status', host: 'host' })).outcome, 'removed');
+    const admin = { _id: actor, siteadmin: 0xFFFFFFFF };
+    assert.equal((await completed.request({ pluginaction: 'remoteInstall.setSettings', defaultDomain: 'other.invalid' }, admin)).defaultDomain, 'other.invalid');
+    assert.equal((await completed.request({ host: 'host' })).host, 'host.other.invalid');
+});
+
+
+test('Push Account Test resolves the DNS domain on both transports and leaves existing settings locks intact', async () => {
+    const admin = { _id: actor, siteadmin: 0xFFFFFFFF };
+    for (const linux of [false, true]) {
+        const f = fixture({ linux, settings: { defaultDomain: 'example.invalid' }, diagnosticMarker: linux ? 'winrm=True' : 'winrm-ok' });
+        assert.equal((await f.request({ pluginaction: 'remoteInstall.testAccount', testHost: 'host' }, admin)).testResult, 'winrm-ok');
+        const probe = f.spawns[0];
+        if (linux) assert.equal(probe.stdin.host, 'host.example.invalid');
+        else assert.match(Buffer.from(probe.args.at(-1), 'base64').toString('utf16le'), /ComputerName 'host.example.invalid'/);
+    }
+    const f = fixture();
+    const lock = path.join(path.parse(process.cwd()).root, 'fictional-fixture', 'remora-remoteinstall-settings.json.lock');
+    f.files.set(lock, 'other writer');
+    assert.equal((await f.request({ pluginaction: 'remoteInstall.setSettings', defaultDomain: 'other.invalid' }, admin)).error, 'settings_unavailable');
+    assert.equal((await f.request()).error, 'target_busy_or_unknown');
+    assert.equal(f.files.get(lock), 'other writer');
+    assert.equal(f.spawns.length, 0);
 });

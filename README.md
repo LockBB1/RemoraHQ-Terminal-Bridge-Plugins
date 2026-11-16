@@ -14,7 +14,7 @@ family.
 | Source repo folder | `RemoraHQ-Terminal-Bridge-Plugins` |
 | Deploy folder under Mesh | `meshcentral/plugins/remoraTerminalBridge` |
 
-## Terminal contract (Bridge 0.15.0)
+## Terminal contract (Bridge 0.16.0)
 
 The `open` action accepts `nodeId`, `shell` (`cmd`, `powershell`, `bash`,
 `zsh`) and the optional `context: "user"`. It returns a session identifier,
@@ -34,20 +34,46 @@ agent behavior are separate and unchanged; this does not close that route.
 Deployments need matching plugin and SPA versions. The `.setup` snapshot is not
 updated by edits to this checkout.
 
-## Remote Install 0.15.0
+## Remote Install 0.16.0
 
 Цели — Windows x64 с Windows PowerShell 5.1 и WinRM. Сервер — Windows
 (сохранённый DPAPI LocalMachine/Negotiate путь) либо Debian (Ruby WinRM,
-Kerberos/GSSAPI). Debian требует полный DNS hostname, SPN `HTTP/hostname`,
+Kerberos/GSSAPI). Debian использует полный DNS hostname, SPN `HTTP/hostname`,
 доступ к KDC/DNS и учётную запись `user@REALM`; IP, NTLM fallback и локальные
 учётные записи для Debian не поддерживаются. LDAP-вход в MeshCentral сам по
 себе не подтверждает Kerberos/WinRM. WinRM HTTP/5985 использует шифрование
 сообщений GSSAPI, пароль в WinRM-клиент не передаётся.
 
-Отдельная диагностика передаёт новый установщик выбранной группы и сообщает
+Кнопка Check installer убрана из рабочего интерфейса после завершения диагностики.
+Прежний API диагностики сохранён для совместимости: он передаёт новый установщик выбранной группы и сообщает
 результаты проверки его SHA-256 и Authenticode, наличие signer и подтверждение
 очистки. Она не запускает установку или удаление и не проверяет ранее переданный
 файл. Потеря связи или неподтверждённая очистка означает неизвестный результат.
+
+Push Account позволяет super-admin отдельно сохранить `defaultDomain` через
+`remoteInstall.setSettings {defaultDomain}` без повторного ввода пароля. Настройка
+хранится в `remora-remoteinstall-settings.json`, отдельно от шифрованного vault;
+`accountStatus` возвращает `settingsVersion: 1` и `defaultDomain` только super-admin.
+Пустая строка отключает дополнение. DNS labels валидируются; protocol/path/IP
+в качестве домена запрещены. Короткое имя дополняется доменом на сервере для
+Check/probe, account Test, run, status, duplicate/record lookup; FQDN и IPv4
+не дополняются. Kerberos realm берётся из push principal и не меняется.
+Check возвращает `resolvedHost`: SPA показывает полный Target и закрепляет его
+для операции и её status/record-delete, даже если настройка позже изменится.
+
+Смена домена блокируется при любой running/unknown операции, sidecar lock или
+нечитаемом состоянии; settings mutex сериализует сохранение и начало run.
+Canonical и короткий alias используют общие locks; одинаковые короткие имена
+разных доменов могут консервативно блокировать друг друга. Legacy short-key
+status остаётся читаемым. При старой unresolved записи без сохранённого host
+и пустом домене короткие run блокируются: используйте явный FQDN и Check.
+Операционные записи и блокировки не мигрируются и не удаляются автоматически.
+
+SPA больше не требует повторного ввода hostname: выбранное действие и основной
+целевой ввод задают intent. Wire `confirmedHost` по-прежнему передаётся для
+совместимости, серверные проверки прав/путей/результата сохранены. Отдельной
+кнопки Refresh outcome нет; Check читает status без повтора destructive команды.
+Unknown по-прежнему блокирует новый run и отображается кратким статусом.
 
 Для **каждого** Install/Reinstall/Remove сервер проверяет authenticated user,
 `canRemoteInstall` и `MESHRIGHT_EDITMESH` на выбранную существующую Machine
@@ -83,8 +109,8 @@ DB и подтверждает пустой результат как `absent`. 
 прав дают `blocked`, а не отсутствие. Ошибка и timeout не считаются удалением.
 
 Результаты удаления службы и карточки показаны отдельно. Если вкладка закрыта
-или ответ delete потерян, карточка может остаться. Refresh outcome для того же
-host/group восстанавливает выбранный nodeId без нового Remove; отдельная
+или ответ delete потерян, карточка может остаться. Check для того же
+host/group также читает read-only status и восстанавливает выбранный nodeId без нового Remove; отдельная
 кнопка удаления записи повторно проверяет права/status. Автоматического повтора
 нет. Подтверждённо отсутствующая запись не удаляется повторно; изменённая,
 недоступная или снова подключённая запись блокирует шаг — проверьте Agents
@@ -179,7 +205,7 @@ timeout, потерянный маркер и сбой после начала d
 
 `remoteInstall.status {host, groupId}` — read-only статус последнего intent:
 `running`, `completed`, `failed`, `unknown`, `outcome`, `mode`, `operationId`, optional `cleanup`.
-После потери связи используйте Refresh outcome; неизвестный результат
+После потери связи используйте Check; неизвестный результат
 блокирует новый run. Локальные `remora-ri-operations/` записи/lock сохраняются
 в datapath до разрешения; после перезапуска незавершённый `running` читается
 как `unknown`. На ПК защищённый SYSTEM/Administrators каталог

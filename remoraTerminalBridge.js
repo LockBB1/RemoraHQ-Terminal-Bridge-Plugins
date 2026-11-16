@@ -187,7 +187,7 @@ var fs = require('fs');
 var path = require('path');
 
 var PLUGIN_SHORT_NAME = 'remoraTerminalBridge';
-var PLUGIN_VERSION = '0.14.0';
+var PLUGIN_VERSION = '0.16.0';
 var ALLOWED_SHELLS = ['cmd', 'powershell', 'bash', 'zsh'];
 // Only native User terminal contexts are issued by this plugin.
 var REMORA_PERMISSIONS_DOC_ID = 'remoraPermissions';
@@ -386,6 +386,59 @@ module.exports.remoraTerminalBridge = function (parent) {
         fs.writeFileSync(p, JSON.stringify(meta, null, 2), { encoding: 'utf8', mode: 0o600 });
     }
 
+    function riSettingsPath() {
+        if (!obj.meshServer || typeof obj.meshServer.datapath !== 'string') throw new Error('no_datapath');
+        return path.join(obj.meshServer.datapath, 'remora-remoteinstall-settings.json');
+    }
+
+    function riValidDomain(value) {
+        return typeof value === 'string' && (value === '' || (value.length <= 253 && !/^[\d.]+$/.test(value) && value.split('.').every(function (label) { return /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/.test(label); })));
+    }
+
+    function riReadSettings() {
+        try {
+            var settings = JSON.parse(fs.readFileSync(riSettingsPath(), 'utf8'));
+            if (!settings || !riValidDomain(settings.defaultDomain)) throw new Error('invalid_settings');
+            return settings;
+        } catch (error) { if (error.code === 'ENOENT') return { defaultDomain: '' }; throw error; }
+    }
+
+    function riResolveHost(value) {
+        if (typeof value !== 'string' || !RI_HOST_RE.test(value.trim())) throw new Error('invalid_host');
+        var host = value.trim().toLowerCase().replace(/\.$/, '');
+        if (!host) throw new Error('invalid_host');
+        var domain = riReadSettings().defaultDomain;
+        if (host.indexOf('.') < 0 && !/^\d+$/.test(host) && domain) host += '.' + domain;
+        if (host.length > 255) throw new Error('invalid_host');
+        return host;
+    }
+
+    function handleRiSetSettings(command, dbGet, session) {
+        var user = dbGet && dbGet.user;
+        if (!isSuperAdmin(user)) return replyError(session, command, 'forbidden');
+        if (!riValidDomain(command.defaultDomain)) return replyError(session, command, 'invalid_domain');
+        var file, locked = false;
+        try {
+            file = riSettingsPath();
+            fs.writeFileSync(file + '.lock', '', { flag: 'wx', mode: 0o600 }); locked = true;
+            var defaultDomain = command.defaultDomain.toLowerCase();
+            if (riReadSettings().defaultDomain !== defaultDomain) {
+                var directory = path.join(obj.meshServer.datapath, 'remora-ri-operations'), entries;
+                try { entries = fs.readdirSync(directory); } catch (error) { if (error.code !== 'ENOENT') throw error; entries = []; }
+                if (entries.some(function (entry) {
+                    if (entry.endsWith('.lock')) return true;
+                    if (!/^[a-f0-9]{64}\.json$/.test(entry)) return false;
+                    var record = JSON.parse(fs.readFileSync(path.join(directory, entry), 'utf8'));
+                    return !record || ['completed', 'failed'].indexOf(record.state) < 0;
+                })) return replyError(session, command, 'settings_busy');
+                riWriteOperation(file, { defaultDomain: defaultDomain });
+            }
+            dispatchRiAudit(user._id, { msg: 'Remote Install default DNS domain updated', actor: user._id, status: 'success' });
+            reply(session, command, { defaultDomain: defaultDomain });
+        } catch (_) { replyError(session, command, 'settings_unavailable'); }
+        finally { if (locked) { try { fs.unlinkSync(file + '.lock'); } catch (_) {} } }
+    }
+
     // PowerShell -EncodedCommand wants base64 of UTF-16LE.
     function psEncode(script) { return Buffer.from(script, 'utf16le').toString('base64'); }
 
@@ -458,9 +511,12 @@ module.exports.remoraTerminalBridge = function (parent) {
     function handleRiAccountStatus(command, dbGet, session) {
         var user = dbGet && dbGet.user;
         if (!isSuperAdmin(user)) return replyError(session, command, 'forbidden');
-        var meta = riReadCredMeta();
+        var meta = riReadCredMeta(), settings;
+        try { settings = riReadSettings(); } catch (_) { return replyError(session, command, 'settings_unavailable'); }
         reply(session, command, {
             lifecycleVersion: 1,
+            settingsVersion: 1,
+            defaultDomain: settings.defaultDomain,
             credentialStore: process.platform === 'linux' ? 'linux-aes-gcm' : 'windows-dpapi',
             configured: !!(meta && meta.blob),
             username: (meta && meta.username) || null,
@@ -523,7 +579,7 @@ module.exports.remoraTerminalBridge = function (parent) {
             return replyError(session, command, 'corrupt_cred');
         }
         var host = (command.testHost != null) ? String(command.testHost) : '';
-        if (host && !RI_HOST_RE.test(host)) return replyError(session, command, 'invalid_host');
+        if (host) { try { host = riResolveHost(host); } catch (error) { return replyError(session, command, error.message === 'invalid_host' ? 'invalid_host' : 'settings_unavailable'); } }
         function complete(err, res) {
             var ok = !err && res && res.code === 0 && /^(winrm-ok|decrypt-ok)$/.test(res.stdout || '');
             var result = ok ? (host ? 'winrm-ok' : 'decrypt-ok') : 'failed';
@@ -863,7 +919,7 @@ module.exports.remoraTerminalBridge = function (parent) {
             }
             var host = String(command.host || '');
             var groupId = String(command.groupId || '');
-            if (!RI_HOST_RE.test(host)) return replyError(session, command, 'invalid_host');
+            try { host = riResolveHost(host); } catch (error) { return replyError(session, command, error.message === 'invalid_host' ? 'invalid_host' : 'settings_unavailable'); }
             if (!RI_GROUP_RE.test(groupId)) return replyError(session, command, 'invalid_group');
             if (!hasGroupInstallRight(user, groupId)) {
                 dispatchRiAudit(user && user._id, { msg: 'Remote Install reachability denied (no rights on group)', actor: user && user._id, host: host, group: groupId, status: 'denied' });
@@ -888,6 +944,7 @@ module.exports.remoraTerminalBridge = function (parent) {
                 riFindExistingNode(user, host, function (scanErr, match) {
                     riRecordCandidates(user, host, function (candidates) { reply(session, command, {
                         lifecycleVersion: 1,
+                        resolvedHost: host,
                         pingChecked: process.platform !== 'linux',
                         reachable: ping, winrm: winrm,
                         existing: !!(match && !scanErr),
@@ -910,7 +967,7 @@ module.exports.remoraTerminalBridge = function (parent) {
         hasRemoteInstallPermission(user, function (allowed) {
             if (!allowed) { dispatchRiAudit(user._id, { msg: 'Remote Install diagnostic denied', actor: user._id, status: 'denied' }); return replyError(session, command, 'permission_denied'); }
             var host = String(command.host || ''), groupId = String(command.groupId || '');
-            if (!RI_HOST_RE.test(host)) return replyError(session, command, 'invalid_host');
+            try { host = riResolveHost(host); } catch (error) { return replyError(session, command, error.message === 'invalid_host' ? 'invalid_host' : 'settings_unavailable'); }
             if (!RI_GROUP_RE.test(groupId)) return replyError(session, command, 'invalid_group');
             if (!hasGroupInstallRight(user, groupId)) { dispatchRiAudit(user._id, { msg: 'Remote Install diagnostic denied', actor: user._id, status: 'denied' }); return replyError(session, command, 'permission_denied'); }
             if (!riRateLimitOk(user._id, riReachTimes, RI_REACH_MAX)) { dispatchRiAudit(user._id, { msg: 'Remote Install diagnostic rate-limited', actor: user._id, status: 'denied' }); return replyError(session, command, 'rate_limited'); }
@@ -959,20 +1016,30 @@ module.exports.remoraTerminalBridge = function (parent) {
         } finally { try { fs.unlinkSync(temporary); } catch (_) { /* renamed */ } }
     }
 
+    function riOperationFiles(host) {
+        var files = [riOperationPath(host)];
+        if (!/^[\d.]+$/.test(host) && host.indexOf('.') >= 0) files.push(riOperationPath(host.split('.')[0]));
+        return files;
+    }
+
     function handleRiOperationStatus(command, dbGet, session) {
         var user = dbGet && dbGet.user;
         if (!user || !user._id) return replyError(session, command, 'auth_required');
         hasRemoteInstallPermission(user, function (allowed) {
             var host = String(command.host || ''), groupId = String(command.groupId || '');
             if (!allowed || !RI_GROUP_RE.test(groupId) || !hasGroupInstallRight(user, groupId)) return replyError(session, command, 'permission_denied');
-            if (!RI_HOST_RE.test(host)) return replyError(session, command, 'invalid_host');
+            try { host = riResolveHost(host); } catch (error) { return replyError(session, command, error.message === 'invalid_host' ? 'invalid_host' : 'settings_unavailable'); }
             if (!riRateLimitOk(user._id, riReachTimes, 90)) return replyError(session, command, 'rate_limited');
             try {
-                var file = riOperationPath(host), record = JSON.parse(fs.readFileSync(file, 'utf8'));
+                var files = riOperationFiles(host), candidates = [];
+                files.forEach(function (file) { try { candidates.push({ file: file, record: JSON.parse(fs.readFileSync(file, 'utf8')) }); } catch (error) { if (error.code !== 'ENOENT') throw error; } });
+                if (candidates.length > 1 && candidates.some(function (candidate) { return candidate.record.state === 'unknown' || candidate.record.state === 'running'; })) throw new Error('ambiguous_status');
+                if (!candidates.length) throw new Error('missing_status');
+                var file = candidates[0].file, record = candidates[0].record;
                 if (record.groupId !== groupId) return replyError(session, command, 'permission_denied');
                 if (record.state === 'running' && !riActive[file]) record.state = 'unknown';
                 riRecordStatus(user, host, record, function (recordRemoval) {
-                    reply(session, command, { state: record.state, outcome: record.outcome, mode: record.mode, operationId: record.operationId, cleanup: record.cleanup, recordRemoval: recordRemoval });
+                    reply(session, command, { host: record.host || host, state: record.state, outcome: record.outcome, mode: record.mode, operationId: record.operationId, cleanup: record.cleanup, recordRemoval: recordRemoval });
                 });
             } catch (_) { replyError(session, command, 'operation_status_unavailable'); }
         });
@@ -992,10 +1059,10 @@ module.exports.remoraTerminalBridge = function (parent) {
             var mode = command.mode == null ? 'install' : command.mode;
             if (['install', 'reinstall', 'remove'].indexOf(mode) === -1) return replyError(session, command, 'invalid_mode');
             var installFlags = (typeof command.installFlags === 'number') ? command.installFlags : 0;
-            if (!RI_HOST_RE.test(host)) return replyError(session, command, 'invalid_host');
+            try { host = riResolveHost(host); } catch (error) { return replyError(session, command, error.message === 'invalid_host' ? 'invalid_host' : 'settings_unavailable'); }
             if (!RI_GROUP_RE.test(groupId)) return replyError(session, command, 'invalid_group');
             if (!Number.isInteger(installFlags) || installFlags < 0 || installFlags > 3) return replyError(session, command, 'invalid_input');
-            if (mode !== 'install' && command.confirmedHost !== host) return replyError(session, command, 'confirmation_required');
+            if (mode !== 'install' && command.confirmedHost !== command.host) return replyError(session, command, 'confirmation_required');
             if (command.removeNodeId != null && mode !== 'remove') return replyError(session, command, 'invalid_input');
 
             // Per-mesh authz: caller must hold install rights on the target group
@@ -1029,27 +1096,50 @@ module.exports.remoraTerminalBridge = function (parent) {
             }
             start();
             function start() {
-            var operationId = command.operationId == null ? crypto.randomBytes(16).toString('hex') : command.operationId, operationFile, record;
+            var operationId = command.operationId == null ? crypto.randomBytes(16).toString('hex') : command.operationId, operationFile, record, lockFiles = [], settingsLock, settingsLocked = false;
             if (typeof operationId !== 'string' || !/^[a-f0-9]{32}$/.test(operationId)) return replyError(session, command, 'invalid_input');
             try {
-                operationFile = riOperationPath(host);
-                // Exclusive sidecar covers both the state check and the write across processes.
-                fs.writeFileSync(operationFile + '.lock', operationId, { flag: 'wx', mode: 0o600 });
+                settingsLock = riSettingsPath() + '.lock';
+                fs.writeFileSync(settingsLock, '', { flag: 'wx', mode: 0o600 }); settingsLocked = true;
+                if (riResolveHost(command.host) !== host) throw new Error('target_changed');
+                if (host.indexOf('.') < 0 && !/^\d+$/.test(host) && !riReadSettings().defaultDomain) {
+                    var directory = path.dirname(riOperationPath(host));
+                    var legacyUnresolved = fs.readdirSync(directory).some(function (entry) {
+                        if (!/^[a-f0-9]{64}\.json$/.test(entry)) return false;
+                        var saved = JSON.parse(fs.readFileSync(path.join(directory, entry), 'utf8'));
+                        return !saved.host && (saved.state === 'running' || saved.state === 'unknown');
+                    });
+                    if (legacyUnresolved) return replyError(session, command, 'legacy_target_unresolved');
+                }
+                var operationFiles = riOperationFiles(host);
+                operationFile = operationFiles[0];
+                // The short-name sidecar also covers unresolved records created before DNS settings.
+                operationFiles.forEach(function (file) {
+                    fs.writeFileSync(file + '.lock', operationId, { flag: 'wx', mode: 0o600 }); lockFiles.push(file + '.lock');
+                    if (file === operationFile) return;
+                    try {
+                        var legacy = JSON.parse(fs.readFileSync(file, 'utf8'));
+                        if (legacy.state === 'running' || legacy.state === 'unknown') throw new Error('legacy_unknown');
+                    } catch (error) { if (error.code !== 'ENOENT') throw error; }
+                });
                 try {
                     var previous = JSON.parse(fs.readFileSync(operationFile, 'utf8'));
-                    if (previous.state === 'running' || previous.state === 'unknown') return replyError(session, command, 'target_busy_or_unknown');
+                    if (previous.state === 'running' || previous.state === 'unknown') throw new Error('unresolved_operation');
                     if (previous.operationId === operationId) {
-                        fs.unlinkSync(operationFile + '.lock');
+                        lockFiles.forEach(function (file) { fs.unlinkSync(file); }); lockFiles = [];
                         if (previous.groupId !== groupId || previous.mode !== mode || previous.actor !== actor || (previous.recordSelection && previous.recordSelection.nodeId) !== (selection && selection.nodeId)) return replyError(session, command, 'invalid_input');
                         if (previous.state === 'failed') return replyError(session, command, previous.outcome);
                         return reply(session, command, { ok: true, host: host, group: groupId, operationId: operationId, mode: mode, outcome: previous.outcome, cleanup: previous.cleanup });
                     }
                 } catch (e) { if (e.code !== 'ENOENT') throw e; }
-                record = { operationId: operationId, actor: actor, groupId: groupId, mode: mode, state: 'running', outcome: null };
+                record = { host: host, operationId: operationId, actor: actor, groupId: groupId, mode: mode, state: 'running', outcome: null };
                 if (selection) record.recordSelection = selection;
                 riWriteOperation(operationFile, record);
                 riActive[operationFile] = true;
-            } catch (_) { return replyError(session, command, 'target_busy_or_unknown'); }
+            } catch (_) {
+                lockFiles.forEach(function (file) { try { fs.unlinkSync(file); } catch (_) {} });
+                return replyError(session, command, 'target_busy_or_unknown');
+            } finally { if (settingsLocked) { try { fs.unlinkSync(settingsLock); } catch (_) {} } }
 
             function finish(outcome, error, cleanup) {
                 if (!riActive[operationFile]) return;
@@ -1059,7 +1149,7 @@ module.exports.remoraTerminalBridge = function (parent) {
                 if (cleanup) record.cleanup = cleanup;
                 try {
                     riWriteOperation(operationFile, record);
-                    if (record.state !== 'unknown') fs.unlinkSync(operationFile + '.lock');
+                    if (record.state !== 'unknown') lockFiles.forEach(function (file) { fs.unlinkSync(file); });
                 } catch (_) { record.state = 'unknown'; error = true; outcome = 'outcome_unknown'; }
                 dispatchRiAudit(actor, { msg: 'Remote Install ' + mode + ': ' + outcome, actor: actor, host: host, group: groupId, operationId: operationId, mode: mode, cleanup: record.cleanup, status: record.state === 'unknown' ? 'unknown' : (error ? 'error' : 'success') });
                 if (error) return replyError(session, command, outcome, { operationId: operationId });
@@ -1180,6 +1270,7 @@ module.exports.remoraTerminalBridge = function (parent) {
         // inside each handler). Kept ahead of the terminal 'open' path so the
         // existing flow below is untouched.
         if (action === 'remoteInstall.accountStatus') return handleRiAccountStatus(command, dbGet, session);
+        if (action === 'remoteInstall.setSettings') return handleRiSetSettings(command, dbGet, session);
         if (action === 'remoteInstall.setAccount') return handleRiSetAccount(command, dbGet, session);
         if (action === 'remoteInstall.testAccount') return handleRiTestAccount(command, dbGet, session);
         if (action === 'remoteInstall.reachability') return handleRiReachability(command, dbGet, session);
