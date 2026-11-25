@@ -187,7 +187,7 @@ var fs = require('fs');
 var path = require('path');
 
 var PLUGIN_SHORT_NAME = 'remoraTerminalBridge';
-var PLUGIN_VERSION = '0.16.0';
+var PLUGIN_VERSION = '0.17.0';
 var ALLOWED_SHELLS = ['cmd', 'powershell', 'bash', 'zsh'];
 // Only native User terminal contexts are issued by this plugin.
 var REMORA_PERMISSIONS_DOC_ID = 'remoraPermissions';
@@ -228,9 +228,10 @@ var PERMISSION_REMOTE_INSTALL = 'canRemoteInstall';
 var PERMISSION_MANAGE_SESSIONS = 'canManageDeviceSessions';
 // Native /meshagents installer download requires this right on the target
 // device group (webserver.js handleMeshAgentRequest: GetMeshRights & 1).
-// Remote Install mirrors it so canRemoteInstall cannot cross into groups the
-// operator has no install rights on (RC-15.N).
+// Remote Install checks effective native rights on the target group.
 var MESHRIGHT_EDITMESH = 0x00000001;
+var MESHRIGHT_REMOTECONTROL = 0x00000008;
+var MESHRIGHT_REMOTEVIEWONLY = 0x00000100;
 // Per-actor rate limit on the privileged push (sliding window).
 var RI_RUN_MAX = 20;
 var RI_RUN_WINDOW_MS = 60 * 1000;
@@ -653,15 +654,15 @@ module.exports.remoraTerminalBridge = function (parent) {
         arr.push(now); bucket[actor] = arr; return true;
     }
 
-    // Per-mesh authz for Remote Install: the caller must hold MESHRIGHT_EDITMESH
-    // on the target group (super-admin implicit). Mirrors the native installer
-    // download check; fail-closed on any missing server API.
+    // The caller needs group-management or interactive operator access. The
+    // separate canRemoteInstall gate still applies; view-only access is denied.
     function hasGroupInstallRight(user, groupId) {
         var ws = obj.meshServer && obj.meshServer.webserver;
         if (!ws || !ws.meshes || !ws.meshes[groupId] || ws.meshes[groupId].mtype !== 2) return false;
         if (isSuperAdmin(user)) return true;
         if (typeof ws.GetMeshRights !== 'function') return false;
-        return (ws.GetMeshRights(user, groupId) & MESHRIGHT_EDITMESH) !== 0;
+        var rights = ws.GetMeshRights(user, groupId);
+        return ((rights & MESHRIGHT_EDITMESH) !== 0) || (((rights & MESHRIGHT_REMOTECONTROL) !== 0) && ((rights & MESHRIGHT_REMOTEVIEWONLY) === 0));
     }
 
     // RC-15.RINST-1 (#14) — does the typed install target already correspond to

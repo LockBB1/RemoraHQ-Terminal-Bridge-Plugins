@@ -143,6 +143,15 @@ test('an authorized operator without TOTP can install, with audit and cleanup', 
     assert.equal(JSON.stringify(result).includes('Zml4dHVyZQ=='), false);
 });
 
+test('group operator access permits installation but view-only access does not', async () => {
+    const operator = fixture({ rights: 0x08 });
+    assert.equal((await operator.request()).result, 'ok');
+    assert.equal(operator.spawns.length, 1);
+    const viewer = fixture({ rights: 0x108 });
+    assert.equal((await viewer.request()).error, 'permission_denied');
+    assert.equal(viewer.spawns.length, 0);
+});
+
 for (const [label, options, command, error] of [
     ['missing grant', { flags: {} }, {}, 'permission_denied'],
     ['explicit deny', { flags: { canRemoteInstall: false } }, {}, 'permission_denied'],

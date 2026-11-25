@@ -14,7 +14,7 @@ family.
 | Source repo folder | `RemoraHQ-Terminal-Bridge-Plugins` |
 | Deploy folder under Mesh | `meshcentral/plugins/remoraTerminalBridge` |
 
-## Terminal contract (Bridge 0.16.0)
+## Terminal contract (Bridge 0.17.0)
 
 The `open` action accepts `nodeId`, `shell` (`cmd`, `powershell`, `bash`,
 `zsh`) and the optional `context: "user"`. It returns a session identifier,
@@ -34,7 +34,7 @@ agent behavior are separate and unchanged; this does not close that route.
 Deployments need matching plugin and SPA versions. The `.setup` snapshot is not
 updated by edits to this checkout.
 
-## Remote Install 0.16.0
+## Remote Install 0.17.0
 
 Цели — Windows x64 с Windows PowerShell 5.1 и WinRM. Сервер — Windows
 (сохранённый DPAPI LocalMachine/Negotiate путь) либо Debian (Ruby WinRM,
@@ -76,8 +76,9 @@ SPA больше не требует повторного ввода hostname: �
 Unknown по-прежнему блокирует новый run и отображается кратким статусом.
 
 Для **каждого** Install/Reinstall/Remove сервер проверяет authenticated user,
-`canRemoteInstall` и `MESHRIGHT_EDITMESH` на выбранную существующую Machine
-Group типа 2. По решению владельца эта привилегия позволяет указать любой
+`canRemoteInstall` и право управления группой либо интерактивного удалённого
+доступа без ограничения просмотра на выбранную существующую Machine Group
+типа 2. По решению владельца эта привилегия позволяет указать любой
 доступный push account Windows-ПК, включая агент старого сервера; выбранная
 группа не является доказательством принадлежности ПК. Выдавайте её только
 операторам, которым разрешён такой охват. Push Account остаётся super-admin-only.
