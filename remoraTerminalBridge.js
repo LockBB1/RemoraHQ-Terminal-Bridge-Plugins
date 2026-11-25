@@ -187,7 +187,7 @@ var fs = require('fs');
 var path = require('path');
 
 var PLUGIN_SHORT_NAME = 'remoraTerminalBridge';
-var PLUGIN_VERSION = '0.17.0';
+var PLUGIN_VERSION = '0.17.1';
 var ALLOWED_SHELLS = ['cmd', 'powershell', 'bash', 'zsh'];
 // Only native User terminal contexts are issued by this plugin.
 var REMORA_PERMISSIONS_DOC_ID = 'remoraPermissions';
@@ -314,8 +314,8 @@ module.exports.remoraTerminalBridge = function (parent) {
         return 'viewer';
     }
 
-    // RC-15.M.2 — resolve the effective value of a RemoraHQ flag:
-    //   override (grants[user][flag], tri-state) ?? roleDefault[role][flag] ?? false
+    // Remote Install requires an explicit user grant; other flags retain the
+    // override ?? roleDefault[role] ?? false resolution.
     // Super-admins pass implicitly. Fail-closed: any missing DB access denies.
     function resolveRemoraFlag(user, flag, cb) {
         if (isSuperAdmin(user)) return cb(true);
@@ -326,6 +326,7 @@ module.exports.remoraTerminalBridge = function (parent) {
             var doc0 = (!err && docs && docs.length > 0) ? docs[0] : null;
             var grants = (doc0 && doc0.grants && typeof doc0.grants === 'object') ? doc0.grants : {};
             var mine = grants[user._id] || {};
+            if (flag === PERMISSION_REMOTE_INSTALL) return cb(mine[flag] === true);
             if (typeof mine[flag] === 'boolean') return cb(mine[flag]); // explicit override wins
             var roleDefaults = (doc0 && doc0.roleDefaults && typeof doc0.roleDefaults === 'object') ? doc0.roleDefaults : {};
             var rd = roleDefaults[deriveRemoraRole(user)] || {};

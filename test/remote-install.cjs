@@ -70,7 +70,7 @@ function fixture(options = {}) {
         GetConnectivityState(id) { return options.connected && options.connected[id] ? { connectivity: 1 } : null; },
         datapath: path.join(path.parse(process.cwd()).root, 'fictional-fixture'),
         db: {
-            Get(_id, cb) { if (_id.startsWith('node/')) return cb(options.nodeReadError ? new Error('Read unavailable') : null, (options.nodes || []).filter(node => node._id === _id)); cb(options.policyError ? new Error('Policy unavailable') : null, [{ grants: { [actor]: flags } }]); },
+            Get(_id, cb) { if (_id.startsWith('node/')) return cb(options.nodeReadError ? new Error('Read unavailable') : null, (options.nodes || []).filter(node => node._id === _id)); cb(options.policyError ? new Error('Policy unavailable') : null, [{ grants: { [actor]: flags }, roleDefaults: options.roleDefaults || {} }]); },
             GetAllType(_type, cb) { cb(options.scanError ? new Error('Scan unavailable') : null, options.nodes ?? []); },
         },
         webserver: {
@@ -150,6 +150,12 @@ test('group operator access permits installation but view-only access does not',
     const viewer = fixture({ rights: 0x108 });
     assert.equal((await viewer.request()).error, 'permission_denied');
     assert.equal(viewer.spawns.length, 0);
+});
+
+test('role defaults alone never grant Remote Install without an explicit user grant', async () => {
+    const f = fixture({ flags: {}, rights: 8, roleDefaults: { viewer: { canRemoteInstall: true } } });
+    assert.equal((await f.request()).error, 'permission_denied');
+    assert.equal(f.spawns.length, 0);
 });
 
 for (const [label, options, command, error] of [

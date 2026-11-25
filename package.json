@@ -1,6 +1,6 @@
 {
   "name": "remorahq-terminal-bridge-plugins",
-  "version": "0.17.0",
+  "version": "0.17.1",
   "description": "RemoraHQ Terminal Bridge MeshCentral plugin",
   "main": "remoraTerminalBridge.js",
   "scripts": {
